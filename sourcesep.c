@@ -1486,7 +1486,15 @@ schedule_precache_rescan(void) {
 static int
 cycle_mode(void) {
     int mode = sourcesep_get_mode();
-    mode = (mode + 1) % 3;
+    if (mode == SOURCESEP_MODE_ORIGINAL) {
+        mode = SOURCESEP_MODE_VOCAL;
+    }
+    else if (mode == SOURCESEP_MODE_VOCAL) {
+        mode = SOURCESEP_MODE_INSTRUMENTAL;
+    }
+    else {
+        mode = SOURCESEP_MODE_ORIGINAL;
+    }
     sourcesep_set_mode(mode);
     update_button_label();
     apply_mode_to_all_playlists(mode);
