@@ -38,8 +38,8 @@ static void cache_index_rewrite_with_filter(const char *remove_cache_path, int m
 static int convert_raw_to_mp3(const char *raw_path, const char *mp3_path, int samplerate, int channels);
 
 #define SOURCESEP_MODE_ORIGINAL 0
-#define SOURCESEP_MODE_INSTRUMENTAL 1
-#define SOURCESEP_MODE_VOCAL 2
+#define SOURCESEP_MODE_VOCAL 1
+#define SOURCESEP_MODE_INSTRUMENTAL 2
 
 #define CACHE_LIMIT_BYTES (1024LL * 1024LL * 1024LL)
 #define CACHE_LIMIT_DEFAULT_MB 1024
@@ -121,7 +121,7 @@ mode_emoji(int mode) {
 static int
 sourcesep_get_mode(void) {
     int mode = deadbeef->conf_get_int("sourcesep.mode", SOURCESEP_MODE_ORIGINAL);
-    if (mode < SOURCESEP_MODE_ORIGINAL || mode > SOURCESEP_MODE_VOCAL) {
+    if (mode < SOURCESEP_MODE_ORIGINAL || mode > SOURCESEP_MODE_INSTRUMENTAL) {
         mode = SOURCESEP_MODE_ORIGINAL;
     }
     return mode;
