@@ -15,6 +15,8 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <poll.h>
+#include <ctype.h>
+#include <sndfile.h>
 
 #include <gtkui_api.h>
 
@@ -23,9 +25,13 @@ extern char **environ;
 static DB_functions_t *deadbeef;
 static DB_decoder_t plugin;
 static int roformer_seek_sample(DB_fileinfo_t *_info, int sample);
+static int get_samplerate(DB_playItem_t *it);
+static int get_channels(DB_playItem_t *it);
+static void notify_waveform_refresh_for_source(const char *source_uri);
 static int cache_index_lookup(const char *uri, int mode, int64_t mtime, int64_t size, int *samplerate, int *channels, char *cache_file_out, size_t out_sz);
-static void build_cache_key(DB_playItem_t *it, int mode, char *hex, size_t hex_sz);
+static int resolve_cache_final_path(DB_playItem_t *it, int mode, char *out, size_t out_sz);
 static void cache_index_rewrite_with_filter(const char *remove_cache_path);
+static int convert_raw_to_mp3(const char *raw_path, const char *mp3_path, int samplerate, int channels);
 
 #define ROFORMER_MODE_ORIGINAL 0
 #define ROFORMER_MODE_INSTRUMENTAL 1
@@ -33,8 +39,6 @@ static void cache_index_rewrite_with_filter(const char *remove_cache_path);
 
 #define CACHE_LIMIT_BYTES (1024LL * 1024LL * 1024LL)
 #define CACHE_LIMIT_DEFAULT_MB 1024
-#define WAV_HEADER_SIZE 44
-
 typedef struct {
     DB_fileinfo_t info;
     DB_playItem_t *track;
@@ -46,13 +50,18 @@ typedef struct {
 
     int using_cache;
     FILE *cache_fp;
+    SNDFILE *cache_snd;
+    SF_INFO cache_sfinfo;
     int64_t cache_bytes_written;
     int64_t cache_data_offset;
+    int64_t cache_frames_written;
 
     int pipe_fd;
     pid_t child_pid;
     FILE *cache_fp_write;
     char cache_final_path[PATH_MAX];
+    char cache_raw_path[PATH_MAX];
+    int owns_temp_cache;
     int stream_finished;
     int cache_valid;
     int need_spawn;
@@ -62,53 +71,6 @@ typedef struct {
 } roformer_info_t;
 
 static void finish_stream(roformer_info_t *ri, int aborted);
-
-static uint32_t
-le32_read(const uint8_t *p) {
-    return ((uint32_t)p[0]) | ((uint32_t)p[1] << 8) | ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
-}
-
-static void
-le32_write(uint8_t *p, uint32_t v) {
-    p[0] = (uint8_t)(v & 0xff);
-    p[1] = (uint8_t)((v >> 8) & 0xff);
-    p[2] = (uint8_t)((v >> 16) & 0xff);
-    p[3] = (uint8_t)((v >> 24) & 0xff);
-}
-
-static void
-le16_write(uint8_t *p, uint16_t v) {
-    p[0] = (uint8_t)(v & 0xff);
-    p[1] = (uint8_t)((v >> 8) & 0xff);
-}
-
-static int
-wav_write_header(FILE *fp, int samplerate, int channels, uint32_t data_size) {
-    if (!fp || samplerate <= 0 || channels <= 0 || channels > 8) {
-        return -1;
-    }
-    uint8_t h[WAV_HEADER_SIZE] = {0};
-    memcpy(h + 0, "RIFF", 4);
-    le32_write(h + 4, 36u + data_size);
-    memcpy(h + 8, "WAVE", 4);
-    memcpy(h + 12, "fmt ", 4);
-    le32_write(h + 16, 16);
-    le16_write(h + 20, 3); // IEEE float
-    le16_write(h + 22, (uint16_t)channels);
-    le32_write(h + 24, (uint32_t)samplerate);
-    le32_write(h + 28, (uint32_t)(samplerate * channels * 4));
-    le16_write(h + 32, (uint16_t)(channels * 4));
-    le16_write(h + 34, 32);
-    memcpy(h + 36, "data", 4);
-    le32_write(h + 40, data_size);
-    if (fseeko(fp, 0, SEEK_SET) != 0) {
-        return -1;
-    }
-    if (fwrite(h, 1, sizeof(h), fp) != sizeof(h)) {
-        return -1;
-    }
-    return 0;
-}
 
 typedef struct {
     char path[PATH_MAX];
@@ -189,6 +151,18 @@ get_cache_dir(char *out, size_t out_sz) {
     }
 }
 
+static void
+get_f32tmp_dir(char *out, size_t out_sz) {
+    if (!out || out_sz == 0) {
+        return;
+    }
+    int n = snprintf(out, out_sz, "/tmp/deadbeef-%d-roformer-cache-f32tmp", (int)getuid());
+    if (n < 0 || (size_t)n >= out_sz) {
+        out[0] = 0;
+        return;
+    }
+}
+
 static int
 safe_path_join2(char *out, size_t out_sz, const char *a, const char *b) {
     if (!out || out_sz == 0 || !a || !b) {
@@ -219,6 +193,30 @@ get_cache_index_path(char *out, size_t out_sz) {
         return -1;
     }
     return safe_path_join2(out, out_sz, cache_dir, "index.txt");
+}
+
+static void
+remove_dir_all_files(const char *dirpath) {
+    if (!dirpath || !dirpath[0]) {
+        return;
+    }
+    DIR *dir = opendir(dirpath);
+    if (!dir) {
+        return;
+    }
+    struct dirent *de;
+    while ((de = readdir(dir)) != NULL) {
+        if (de->d_name[0] == '.') {
+            continue;
+        }
+        char full[PATH_MAX];
+        if (safe_path_join2(full, sizeof(full), dirpath, de->d_name) != 0) {
+            continue;
+        }
+        unlink(full);
+    }
+    closedir(dir);
+    rmdir(dirpath);
 }
 
 static int
@@ -342,12 +340,15 @@ cache_index_write_header(FILE *fp) {
 }
 
 static int
-path_has_wav_ext(const char *path) {
+path_has_mp3_ext(const char *path) {
     if (!path) {
         return 0;
     }
-    size_t n = strlen(path);
-    return n >= 4 && !strcmp(path + n - 4, ".wav");
+    const char *ext = strrchr(path, '.');
+    if (!ext) {
+        return 0;
+    }
+    return !strcasecmp(ext, ".mp3");
 }
 
 static int
@@ -639,7 +640,7 @@ cache_index_lookup(const char *uri, int mode, int64_t mtime, int64_t size, int *
             if (!e.complete) {
                 continue;
             }
-            if (!path_has_wav_ext(e.cache_file)) {
+            if (!path_has_mp3_ext(e.cache_file)) {
                 continue;
             }
             if (snprintf(cache_file_out, out_sz, "%s", e.cache_file) < 0) {
@@ -844,7 +845,7 @@ path_list_contains(char **paths, size_t npaths, const char *path) {
 }
 
 static void
-cache_remove_unindexed_wavs(void) {
+cache_remove_unindexed_mp3s(void) {
     char cache_dir[PATH_MAX];
     get_cache_dir(cache_dir, sizeof(cache_dir));
     if (!cache_dir[0]) {
@@ -868,7 +869,7 @@ cache_remove_unindexed_wavs(void) {
             if (index_parse_line(line, &e) != 0) {
                 continue;
             }
-            if (!path_has_wav_ext(e.cache_file)) {
+            if (!path_has_mp3_ext(e.cache_file)) {
                 continue;
             }
             if (nindexed == cap) {
@@ -891,7 +892,7 @@ cache_remove_unindexed_wavs(void) {
             if (de->d_name[0] == '.') {
                 continue;
             }
-            if (!path_has_wav_ext(de->d_name)) {
+            if (!path_has_mp3_ext(de->d_name)) {
                 continue;
             }
             char full[PATH_MAX];
@@ -912,11 +913,21 @@ cache_remove_unindexed_wavs(void) {
     free(indexed);
 }
 
+static int
+path_has_suffix(const char *path, const char *suffix) {
+    if (!path || !suffix) {
+        return 0;
+    }
+    size_t n = strlen(path);
+    size_t s = strlen(suffix);
+    return n >= s && !strcmp(path + n - s, suffix);
+}
+
 static void
-cache_remove_dir_all(void) {
+cache_remove_stale_temp_files(void) {
     char cache_dir[PATH_MAX];
-    int n = snprintf(cache_dir, sizeof(cache_dir), "/tmp/deadbeef-%d-roformer-cache", (int)getuid());
-    if (n < 0 || (size_t)n >= sizeof(cache_dir)) {
+    get_f32tmp_dir(cache_dir, sizeof(cache_dir));
+    if (!cache_dir[0]) {
         return;
     }
     DIR *dir = opendir(cache_dir);
@@ -928,14 +939,83 @@ cache_remove_dir_all(void) {
         if (de->d_name[0] == '.') {
             continue;
         }
+        if (!(path_has_suffix(de->d_name, ".f32tmp") || strstr(de->d_name, ".f32tmp.")
+              || path_has_suffix(de->d_name, ".mp3tmp") || strstr(de->d_name, ".mp3tmp."))) {
+            continue;
+        }
         char full[PATH_MAX];
         if (safe_path_join2(full, sizeof(full), cache_dir, de->d_name) != 0) {
             continue;
         }
-        unlink(full);
+        struct stat st = {0};
+        if (stat(full, &st) != 0 || !S_ISREG(st.st_mode)) {
+            continue;
+        }
+        if (unlink(full) == 0) {
+            trace("roformer: removed stale temp cache %s\n", full);
+        }
     }
     closedir(dir);
-    rmdir(cache_dir);
+}
+
+static int
+find_existing_temp_raw_for_cache(const char *cache_final_path, char *out, size_t out_sz) {
+    if (!cache_final_path || !cache_final_path[0] || !out || out_sz == 0) {
+        return -1;
+    }
+    out[0] = 0;
+    const char *slash = strrchr(cache_final_path, '/');
+    if (!slash) {
+        return -1;
+    }
+    char cache_dir[PATH_MAX] = {0};
+    get_f32tmp_dir(cache_dir, sizeof(cache_dir));
+    if (!cache_dir[0]) {
+        return -1;
+    }
+    const char *base = slash + 1;
+
+    char prefix[PATH_MAX] = {0};
+    if (snprintf(prefix, sizeof(prefix), "%s.f32tmp.", base) < 0) {
+        return -1;
+    }
+
+    DIR *dir = opendir(cache_dir);
+    if (!dir) {
+        return -1;
+    }
+    struct dirent *de;
+    while ((de = readdir(dir)) != NULL) {
+        if (de->d_name[0] == '.') {
+            continue;
+        }
+        if (strncmp(de->d_name, prefix, strlen(prefix)) != 0) {
+            continue;
+        }
+        char full[PATH_MAX];
+        if (safe_path_join2(full, sizeof(full), cache_dir, de->d_name) != 0) {
+            continue;
+        }
+        struct stat st = {0};
+        if (stat(full, &st) != 0 || !S_ISREG(st.st_mode)) {
+            continue;
+        }
+        strncpy(out, full, out_sz - 1);
+        closedir(dir);
+        return 0;
+    }
+    closedir(dir);
+    return -1;
+}
+
+static void
+cache_remove_dir_all(void) {
+    char cache_dir[PATH_MAX];
+    get_cache_dir(cache_dir, sizeof(cache_dir));
+    remove_dir_all_files(cache_dir);
+    char f32tmp_dir[PATH_MAX];
+    get_f32tmp_dir(f32tmp_dir, sizeof(f32tmp_dir));
+    remove_dir_all_files(f32tmp_dir);
 }
 
 static int
@@ -1165,6 +1245,9 @@ precache_single_track(DB_playItem_t *it, int mode) {
     if (cache_has_complete_entry(uri_copy, mode, mtime, size)) {
         return;
     }
+    if (uri_is_currently_playing_or_loaded(uri_copy)) {
+        return;
+    }
 
     char cache_dir[PATH_MAX];
     get_cache_dir(cache_dir, sizeof(cache_dir));
@@ -1172,18 +1255,15 @@ precache_single_track(DB_playItem_t *it, int mode) {
         return;
     }
     ensure_dir(cache_dir);
-    char key[64];
-    build_cache_key(it, mode, key, sizeof(key));
-    char final_name[80];
-    if (snprintf(final_name, sizeof(final_name), "%s.wav", key) < 0) {
-        return;
-    }
     char final_path[PATH_MAX];
-    if (safe_path_join2(final_path, sizeof(final_path), cache_dir, final_name) != 0) {
+    if (resolve_cache_final_path(it, mode, final_path, sizeof(final_path)) != 0) {
         return;
     }
 
     if (cache_has_complete_entry(uri_copy, mode, mtime, size)) {
+        return;
+    }
+    if (uri_is_currently_playing_or_loaded(uri_copy)) {
         return;
     }
 
@@ -1203,12 +1283,12 @@ precache_single_track(DB_playItem_t *it, int mode) {
     const char *python = deadbeef->conf_get_str_fast("roformer.python", "python3");
 
     char cmd[PATH_MAX * 8];
-    const char *out_name = mode == ROFORMER_MODE_VOCAL ? "_vocals.wav" : "_instrumental.wav";
+    const char *out_name = mode == ROFORMER_MODE_VOCAL ? "_vocals.mp3" : "_instrumental.mp3";
     if (snprintf(
             cmd, sizeof(cmd),
             "outdir=$(mktemp -d) && "
             "base=$(basename \"$1\") && stem=${base%%.*} && "
-            "\"%s\" \"%s\" --config_path \"%s\" --model_path \"%s\" --input \"$1\" --store_dir \"$outdir\" >/dev/null 2>&1 && "
+            "\"%s\" \"%s\" --config_path \"%s\" --model_path \"%s\" --input \"$1\" --store_dir \"$outdir\" --mp3 >/dev/null 2>&1 && "
             "src=\"$outdir/${stem}%s\" && [ -f \"$src\" ] && cp -f \"$src\" \"$2\"; "
             "status=$?; rm -rf \"$outdir\"; exit $status",
             python, inference_path, config_path, model_path, out_name) < 0) {
@@ -1230,22 +1310,14 @@ precache_single_track(DB_playItem_t *it, int mode) {
         return;
     }
     struct stat st = {0};
-    if (stat(final_path, &st) != 0 || !S_ISREG(st.st_mode) || st.st_size < WAV_HEADER_SIZE + 8) {
+    if (stat(final_path, &st) != 0 || !S_ISREG(st.st_mode) || st.st_size < 64) {
         unlink(final_path);
         return;
     }
-    FILE *chk = fopen(final_path, "rb");
-    int sr = 44100;
-    int ch = 2;
-    if (chk) {
-        uint8_t hh[WAV_HEADER_SIZE];
-        if (fread(hh, 1, sizeof(hh), chk) == sizeof(hh) && !memcmp(hh + 0, "RIFF", 4) && !memcmp(hh + 8, "WAVE", 4)) {
-            ch = (int)(hh[22] | (hh[23] << 8));
-            sr = (int)le32_read(hh + 24);
-        }
-        fclose(chk);
-    }
+    int sr = get_samplerate(it);
+    int ch = get_channels(it);
     cache_index_upsert(uri_copy, mode, mtime, size, sr, ch, 1, final_path);
+    notify_waveform_refresh_for_source(uri_copy);
     (void)precache_make_room_or_stop();
 }
 
@@ -1465,35 +1537,121 @@ get_channels(DB_playItem_t *it) {
 }
 
 static void
-build_cache_key(DB_playItem_t *it, int mode, char *hex, size_t hex_sz) {
-    uint8_t digest[16];
-    DB_md5_t md5;
-    deadbeef->md5_init(&md5);
+sanitize_filename_component(const char *in, char *out, size_t out_sz) {
+    if (!out || out_sz == 0) {
+        return;
+    }
+    out[0] = 0;
+    if (!in || !in[0]) {
+        return;
+    }
+    size_t j = 0;
+    for (size_t i = 0; in[i] && j + 1 < out_sz; i++) {
+        unsigned char c = (unsigned char)in[i];
+        if (isalnum(c) || c == '-' || c == '_' || c == ' ') {
+            out[j++] = (char)c;
+        }
+        else {
+            out[j++] = '_';
+        }
+    }
+    while (j > 0 && (out[j - 1] == ' ' || out[j - 1] == '.')) {
+        j--;
+    }
+    out[j] = 0;
+}
+
+static void
+build_cache_filename(DB_playItem_t *it, int mode, char *name_out, size_t name_out_sz) {
+    if (!name_out || name_out_sz == 0) {
+        return;
+    }
+    name_out[0] = 0;
+    if (!it) {
+        return;
+    }
 
     deadbeef->pl_lock();
     const char *uri = deadbeef->pl_find_meta(it, ":ROFORMER_SOURCE_URI");
-    char uri_copy[PATH_MAX] = {0};
     if (!uri) {
         uri = deadbeef->pl_find_meta(it, ":URI");
     }
+    char uri_copy[PATH_MAX] = {0};
     if (uri) {
         strncpy(uri_copy, uri, sizeof(uri_copy) - 1);
-        deadbeef->md5_append(&md5, (const uint8_t *)uri, (int)strlen(uri));
     }
     deadbeef->pl_unlock();
 
-    struct stat st = {0};
-    if (uri_copy[0] && !strncmp(uri_copy, "file://", 7)) {
-        const char *path = uri_copy + 7;
-        if (stat(path, &st) == 0) {
-            deadbeef->md5_append(&md5, (const uint8_t *)&st.st_mtime, sizeof(st.st_mtime));
-            deadbeef->md5_append(&md5, (const uint8_t *)&st.st_size, sizeof(st.st_size));
-        }
+    const char *path = uri_copy;
+    if (!strncmp(path, "file://", 7)) {
+        path += 7;
     }
-    deadbeef->md5_append(&md5, (const uint8_t *)&mode, sizeof(mode));
-    deadbeef->md5_finish(&md5, digest);
-    deadbeef->md5_to_str(hex, digest);
-    hex[hex_sz - 1] = 0;
+    const char *base = strrchr(path, '/');
+    base = base ? base + 1 : path;
+    if (!base || !base[0]) {
+        base = "track";
+    }
+
+    char stem[PATH_MAX] = {0};
+    strncpy(stem, base, sizeof(stem) - 1);
+    char *dot = strrchr(stem, '.');
+    if (dot) {
+        *dot = 0;
+    }
+
+    char safe_stem[PATH_MAX] = {0};
+    sanitize_filename_component(stem, safe_stem, sizeof(safe_stem));
+    if (!safe_stem[0]) {
+        strncpy(safe_stem, "track", sizeof(safe_stem) - 1);
+    }
+
+    const char *suffix = mode == ROFORMER_MODE_VOCAL ? ".vocal.mp3" : ".instr.mp3";
+    snprintf(name_out, name_out_sz, "%s%s", safe_stem, suffix);
+}
+
+static int
+resolve_cache_final_path(DB_playItem_t *it, int mode, char *out, size_t out_sz) {
+    if (!it || !out || out_sz == 0) {
+        return -1;
+    }
+    out[0] = 0;
+    char cache_dir[PATH_MAX];
+    get_cache_dir(cache_dir, sizeof(cache_dir));
+    if (!cache_dir[0]) {
+        return -1;
+    }
+    char name[PATH_MAX];
+    build_cache_filename(it, mode, name, sizeof(name));
+    if (!name[0]) {
+        return -1;
+    }
+    return safe_path_join2(out, out_sz, cache_dir, name);
+}
+
+static int
+convert_raw_to_mp3(const char *raw_path, const char *mp3_path, int samplerate, int channels) {
+    if (!raw_path || !raw_path[0] || !mp3_path || !mp3_path[0] || samplerate <= 0 || channels <= 0) {
+        return -1;
+    }
+    char cmd[PATH_MAX * 6];
+    if (snprintf(cmd, sizeof(cmd),
+            "ffmpeg -y -f f32le -ar %d -ac %d -i \"$1\" -codec:a libmp3lame -q:a 0 \"$2\" >/dev/null 2>&1",
+            samplerate, channels) < 0) {
+        return -1;
+    }
+    pid_t pid = fork();
+    if (pid == 0) {
+        execl("/bin/sh", "sh", "-c", cmd, "sh", raw_path, mp3_path, (char *)NULL);
+        _exit(127);
+    }
+    if (pid <= 0) {
+        return -1;
+    }
+    int status = 0;
+    if (waitpid(pid, &status, 0) < 0) {
+        return -1;
+    }
+    return (WIFEXITED(status) && WEXITSTATUS(status) == 0) ? 0 : -1;
 }
 
 static int
@@ -1581,25 +1739,36 @@ spawn_inference(roformer_info_t *ri, const char *src_uri, int mode) {
     }
     trace("roformer: spawn success pid=%d pipe_fd=%d\n", (int)pid, ri->pipe_fd);
 
-    ri->cache_fp_write = fopen(ri->cache_final_path, "wb");
+    const char *base = strrchr(ri->cache_final_path, '/');
+    base = base ? base + 1 : ri->cache_final_path;
+    char f32tmp_dir[PATH_MAX];
+    get_f32tmp_dir(f32tmp_dir, sizeof(f32tmp_dir));
+    if (!f32tmp_dir[0]) {
+        return -1;
+    }
+    ensure_dir(f32tmp_dir);
+    char raw_name[PATH_MAX];
+    if (snprintf(raw_name, sizeof(raw_name), "%s.f32tmp.%d.%llx",
+            base, (int)getpid(), (unsigned long long)(uintptr_t)ri) < 0) {
+        return -1;
+    }
+    if (safe_path_join2(ri->cache_raw_path, sizeof(ri->cache_raw_path), f32tmp_dir, raw_name) != 0) {
+        return -1;
+    }
+    ri->cache_fp_write = fopen(ri->cache_raw_path, "wb");
     if (!ri->cache_fp_write) {
-        trace("roformer: cache open failed path=%s errno=%d\n", ri->cache_final_path, errno);
+        trace("roformer: cache open failed path=%s errno=%d\n", ri->cache_raw_path, errno);
         return 0;
     }
-    if (wav_write_header(ri->cache_fp_write, ri->samplerate, ri->channels, 0) != 0) {
-        trace("roformer: wav header write failed path=%s errno=%d\n", ri->cache_final_path, errno);
-        fclose(ri->cache_fp_write);
-        ri->cache_fp_write = NULL;
-        return 0;
-    }
-    fflush(ri->cache_fp_write);
-    trace("roformer: cache write opened path=%s\n", ri->cache_final_path);
-    ri->cache_bytes_written = WAV_HEADER_SIZE;
-    ri->cache_data_offset = WAV_HEADER_SIZE;
+    ri->owns_temp_cache = 1;
+    trace("roformer: cache write opened path=%s\n", ri->cache_raw_path);
+    ri->cache_bytes_written = 0;
+    ri->cache_data_offset = 0;
+    ri->cache_frames_written = 0;
     if (!ri->cache_fp) {
-        ri->cache_fp = fopen(ri->cache_final_path, "rb");
+        ri->cache_fp = fopen(ri->cache_raw_path, "rb");
         if (!ri->cache_fp) {
-            trace("roformer: cache read open failed path=%s errno=%d\n", ri->cache_final_path, errno);
+            trace("roformer: cache read open failed path=%s errno=%d\n", ri->cache_raw_path, errno);
         }
         else {
             ri->using_cache = 1;
@@ -1611,74 +1780,30 @@ spawn_inference(roformer_info_t *ri, const char *src_uri, int mode) {
 
 static int
 open_cache_if_available(roformer_info_t *ri, const char *cache_path) {
-    FILE *fp = fopen(cache_path, "rb");
-    if (!fp) {
-        return -1;
-    }
     struct stat st = {0};
     if (stat(cache_path, &st) != 0 || !S_ISREG(st.st_mode)) {
-        fclose(fp);
         return -1;
     }
-    uint8_t h[12];
-    if (st.st_size < 12 || fread(h, 1, sizeof(h), fp) != sizeof(h)) {
-        fclose(fp);
+    SF_INFO sfinfo = {0};
+    SNDFILE *sfp = sf_open(cache_path, SFM_READ, &sfinfo);
+    if (!sfp) {
         return -1;
     }
-    if (memcmp(h + 0, "RIFF", 4) || memcmp(h + 8, "WAVE", 4)) {
-        fclose(fp);
+    if (sfinfo.samplerate <= 0 || sfinfo.channels <= 0 || sfinfo.channels > 8
+        || sfinfo.samplerate != ri->samplerate || sfinfo.channels != ri->channels) {
+        sf_close(sfp);
         return -1;
     }
-    int fmt = 0;
-    int ch = 0;
-    int sr = 0;
-    int bps = 0;
-    int64_t data_off = -1;
-    while (1) {
-        uint8_t chdr[8];
-        if (fread(chdr, 1, sizeof(chdr), fp) != sizeof(chdr)) {
-            break;
-        }
-        uint32_t csz = le32_read(chdr + 4);
-        off_t data_pos = ftello(fp);
-        if (!memcmp(chdr, "fmt ", 4)) {
-            uint8_t fmtbuf[40] = {0};
-            size_t need = csz < sizeof(fmtbuf) ? csz : sizeof(fmtbuf);
-            if (need < 16 || fread(fmtbuf, 1, need, fp) != need) {
-                fclose(fp);
-                return -1;
-            }
-            fmt = (int)(fmtbuf[0] | (fmtbuf[1] << 8));
-            ch = (int)(fmtbuf[2] | (fmtbuf[3] << 8));
-            sr = (int)le32_read(fmtbuf + 4);
-            bps = (int)(fmtbuf[14] | (fmtbuf[15] << 8));
-            off_t skip = (off_t)csz - (off_t)need;
-            if (skip > 0) {
-                fseeko(fp, skip, SEEK_CUR);
-            }
-        }
-        else if (!memcmp(chdr, "data", 4)) {
-            data_off = data_pos;
-            fseeko(fp, (off_t)csz, SEEK_CUR);
-        }
-        else {
-            fseeko(fp, (off_t)csz, SEEK_CUR);
-        }
-        if (csz & 1) {
-            fseeko(fp, 1, SEEK_CUR);
-        }
-        if (fmt && data_off >= 0) {
-            break;
-        }
+    if (ri->cache_fp) {
+        fclose(ri->cache_fp);
+        ri->cache_fp = NULL;
     }
-    if (fmt != 3 || bps != 32 || ch <= 0 || ch > 8 || sr <= 0 || sr != ri->samplerate || ch != ri->channels || data_off < 0) {
-        fclose(fp);
-        return -1;
-    }
-    ri->cache_fp = fp;
+    ri->cache_snd = sfp;
+    ri->cache_sfinfo = sfinfo;
     ri->using_cache = 1;
     ri->cache_bytes_written = st.st_size;
-    ri->cache_data_offset = data_off;
+    ri->cache_data_offset = 0;
+    ri->cache_frames_written = sfinfo.frames;
     ri->stream_finished = 1;
     ri->cache_valid = 1;
     trace("roformer: cache hit %s\n", cache_path);
@@ -1763,27 +1888,26 @@ cache_file_plausible(roformer_info_t *ri, const char *cache_path) {
     return st.st_size >= expected;
 }
 
-static int
-is_source_currently_playing(const char *source_uri) {
+static void
+notify_waveform_refresh_for_source(const char *source_uri) {
     if (!source_uri || !source_uri[0]) {
-        return 0;
+        return;
     }
     DB_playItem_t *playing = deadbeef->streamer_get_playing_track_safe();
     if (!playing) {
-        return 0;
+        return;
     }
     char playing_src[PATH_MAX] = {0};
-    deadbeef->pl_lock();
-    const char *src = deadbeef->pl_find_meta(playing, ":ROFORMER_SOURCE_URI");
-    if (!src) {
-        src = deadbeef->pl_find_meta(playing, ":URI");
+    get_track_source_uri(playing, playing_src, sizeof(playing_src));
+    if (playing_src[0] && !strcmp(playing_src, source_uri)) {
+        ddb_event_track_t *ev = (ddb_event_track_t *)deadbeef->event_alloc(DB_EV_TRACKINFOCHANGED);
+        if (ev) {
+            ev->track = playing;
+            deadbeef->pl_item_ref(ev->track);
+            deadbeef->event_send((ddb_event_t *)ev, 0, 0);
+        }
     }
-    if (src) {
-        strncpy(playing_src, src, sizeof(playing_src) - 1);
-    }
-    deadbeef->pl_unlock();
     deadbeef->pl_item_unref(playing);
-    return playing_src[0] && !strcmp(playing_src, source_uri);
 }
 
 static DB_fileinfo_t *
@@ -1844,13 +1968,7 @@ roformer_init(DB_fileinfo_t *_info, DB_playItem_t *it) {
     else {
         ri->samplerate = get_samplerate(it);
         ri->channels = get_channels(it);
-        char key[64];
-        build_cache_key(it, ri->mode, key, sizeof(key));
-        char final_name[80];
-        if (snprintf(final_name, sizeof(final_name), "%s.wav", key) < 0) {
-            return -1;
-        }
-        if (safe_path_join2(ri->cache_final_path, sizeof(ri->cache_final_path), cache_dir, final_name) != 0) {
+        if (resolve_cache_final_path(it, ri->mode, ri->cache_final_path, sizeof(ri->cache_final_path)) != 0) {
             return -1;
         }
     }
@@ -1859,10 +1977,41 @@ roformer_init(DB_fileinfo_t *_info, DB_playItem_t *it) {
         ri->samplerate, ri->channels, ri->bytes_per_frame, ri->cache_final_path);
 
     if (open_cache_if_available(ri, ri->cache_final_path) != 0 || !cache_file_plausible(ri, ri->cache_final_path)) {
+        char existing_raw[PATH_MAX] = {0};
+        if (find_existing_temp_raw_for_cache(ri->cache_final_path, existing_raw, sizeof(existing_raw)) == 0) {
+            ri->need_spawn = 0;
+            ri->using_cache = 1;
+            ri->cache_data_offset = 0;
+            if (ri->cache_fp) {
+                fclose(ri->cache_fp);
+                ri->cache_fp = NULL;
+            }
+            ri->cache_fp = fopen(existing_raw, "rb");
+            if (ri->cache_fp) {
+                struct stat rst = {0};
+                if (stat(existing_raw, &rst) == 0 && S_ISREG(rst.st_mode)) {
+                    ri->cache_bytes_written = rst.st_size;
+                }
+                trace("roformer: reusing active temp cache %s for %s\n", existing_raw, ri->cache_final_path);
+                _info->plugin = &plugin;
+                _info->fmt.channels = ri->channels;
+                _info->fmt.bps = 32;
+                _info->fmt.is_float = 1;
+                _info->fmt.samplerate = ri->samplerate;
+                _info->fmt.channelmask = ri->channels == 1 ? DDB_SPEAKER_FRONT_LEFT : (DDB_SPEAKER_FRONT_LEFT | DDB_SPEAKER_FRONT_RIGHT);
+                _info->readpos = 0;
+                cache_enforce_limit();
+                return 0;
+            }
+        }
         if (ri->cache_fp) {
             fclose(ri->cache_fp);
             ri->cache_fp = NULL;
             ri->using_cache = 0;
+        }
+        if (ri->cache_snd) {
+            sf_close(ri->cache_snd);
+            ri->cache_snd = NULL;
         }
         trace("roformer: cache miss %s\n", ri->cache_final_path);
         if (!access(ri->cache_final_path, F_OK)) {
@@ -1913,17 +2062,93 @@ finish_stream(roformer_info_t *ri, int aborted) {
     if (ri->cache_fp_write) {
         fclose(ri->cache_fp_write);
         ri->cache_fp_write = NULL;
-        struct stat st = {0};
-        int have_size = stat(ri->cache_final_path, &st) == 0 && S_ISREG(st.st_mode);
-        int enough_data = have_size && st.st_size >= WAV_HEADER_SIZE + ri->bytes_per_frame;
-        if (!aborted && child_ok && enough_data) {
-            FILE *fp_fix = fopen(ri->cache_final_path, "r+b");
-            if (fp_fix) {
-                uint32_t data_size = (uint32_t)(st.st_size - WAV_HEADER_SIZE);
-                wav_write_header(fp_fix, ri->samplerate, ri->channels, data_size);
-                fclose(fp_fix);
+
+        int convert_ok = !aborted && child_ok;
+        char mp3_tmp_path[PATH_MAX] = {0};
+        if (convert_ok) {
+            if (snprintf(mp3_tmp_path, sizeof(mp3_tmp_path), "%s.mp3tmp.%d.%llx",
+                    ri->cache_final_path, (int)getpid(), (unsigned long long)(uintptr_t)ri) < 0) {
+                convert_ok = 0;
             }
+        }
+
+        if (convert_ok) {
+            convert_ok = convert_raw_to_mp3(ri->cache_raw_path, mp3_tmp_path, ri->samplerate, ri->channels) == 0;
+            if (!convert_ok) {
+                trace("roformer: failed to convert raw to mp3 %s -> %s\n", ri->cache_raw_path, mp3_tmp_path);
+            }
+        }
+
+        int finalized = 0;
+        int keep_raw_for_playback = 0;
+        if (convert_ok) {
+            struct stat st = {0};
+            int have_size = stat(mp3_tmp_path, &st) == 0 && S_ISREG(st.st_mode);
+            int enough_data = have_size && st.st_size >= 64;
+            if (enough_data && rename(mp3_tmp_path, ri->cache_final_path) == 0) {
+                finalized = 1;
+            }
+            else {
+                if (!enough_data) {
+                    trace("roformer: mp3 temp too small for finalize %s\n", mp3_tmp_path);
+                }
+                else {
+                    trace("roformer: failed to rename %s -> %s errno=%d\n", mp3_tmp_path, ri->cache_final_path, errno);
+                }
+                unlink(mp3_tmp_path);
+                convert_ok = 0;
+                if (!aborted && child_ok) {
+                    keep_raw_for_playback = 1;
+                }
+            }
+        }
+        else if (!aborted && child_ok) {
+            keep_raw_for_playback = 1;
+        }
+
+        if (!keep_raw_for_playback) {
+            if (ri->owns_temp_cache && ri->cache_raw_path[0] && unlink(ri->cache_raw_path) != 0 && errno != ENOENT) {
+                trace("roformer: failed to remove temp cache %s errno=%d\n", ri->cache_raw_path, errno);
+            }
+            ri->owns_temp_cache = 0;
+            ri->cache_raw_path[0] = 0;
+        }
+        if (ri->cache_snd) {
+            sf_close(ri->cache_snd);
+            ri->cache_snd = NULL;
+        }
+
+        if (!finalized && !keep_raw_for_playback && open_cache_if_available(ri, ri->cache_final_path) == 0) {
+            finalized = 1;
+        }
+        if (keep_raw_for_playback) {
+            if (ri->cache_fp) {
+                fclose(ri->cache_fp);
+                ri->cache_fp = NULL;
+            }
+            if (ri->cache_raw_path[0]) {
+                ri->cache_fp = fopen(ri->cache_raw_path, "rb");
+                if (ri->cache_fp) {
+                    struct stat rst = {0};
+                    if (stat(ri->cache_raw_path, &rst) == 0 && S_ISREG(rst.st_mode)) {
+                        ri->cache_bytes_written = rst.st_size;
+                    }
+                    ri->using_cache = 1;
+                }
+            }
+        }
+        if (finalized) {
+            if (ri->cache_fp) {
+                fclose(ri->cache_fp);
+                ri->cache_fp = NULL;
+            }
+            if (ri->owns_temp_cache && ri->cache_raw_path[0] && unlink(ri->cache_raw_path) != 0 && errno != ENOENT) {
+                trace("roformer: failed to remove temp cache %s errno=%d\n", ri->cache_raw_path, errno);
+            }
+            ri->owns_temp_cache = 0;
+            ri->cache_raw_path[0] = 0;
             ri->cache_valid = 1;
+            ri->cache_data_offset = 0;
             cache_index_upsert(
                 ri->source_uri,
                 ri->mode,
@@ -1934,19 +2159,16 @@ finish_stream(roformer_info_t *ri, int aborted) {
                 1,
                 ri->cache_final_path);
             trace("roformer: cache finalized %s\n", ri->cache_final_path);
-            if (is_source_currently_playing(ri->source_uri)) {
-                float cur = deadbeef->streamer_get_playpos();
-                if (cur < 0) {
-                    cur = 0;
-                }
-                deadbeef->sendmessage(DB_EV_SEEK, 0, (uint32_t)(cur * 1000.0f), 0);
-            }
         }
-        else {
-            unlink(ri->cache_final_path);
-            cache_index_rewrite_with_filter(ri->cache_final_path);
-            trace("roformer: cache stop aborted=%d child_ok=%d enough_data=%d cache=%s\n",
-                aborted, child_ok, enough_data, ri->cache_final_path);
+        if (!aborted && child_ok) {
+            notify_waveform_refresh_for_source(ri->source_uri);
+        }
+        if (!finalized) {
+            if (mp3_tmp_path[0] && unlink(mp3_tmp_path) != 0 && errno != ENOENT) {
+                trace("roformer: failed to remove mp3 temp %s errno=%d\n", mp3_tmp_path, errno);
+            }
+            trace("roformer: cache stop aborted=%d child_ok=%d convert_ok=%d keep_raw=%d cache=%s\n",
+                aborted, child_ok, convert_ok, keep_raw_for_playback, ri->cache_final_path);
         }
     }
     cache_enforce_limit();
@@ -1965,11 +2187,22 @@ roformer_free(DB_fileinfo_t *_info) {
         fclose(ri->cache_fp);
         ri->cache_fp = NULL;
     }
+    if (ri->cache_snd) {
+        sf_close(ri->cache_snd);
+        ri->cache_snd = NULL;
+    }
 
     if (ri->child_pid > 0) {
         kill(ri->child_pid, SIGTERM);
     }
     finish_stream(ri, 1);
+    if (ri->owns_temp_cache && ri->cache_raw_path[0]) {
+        if (unlink(ri->cache_raw_path) != 0 && errno != ENOENT) {
+            trace("roformer: failed to remove temp cache on free %s errno=%d\n", ri->cache_raw_path, errno);
+        }
+    }
+    ri->owns_temp_cache = 0;
+    ri->cache_raw_path[0] = 0;
     if (ri->track) {
         deadbeef->pl_item_unref(ri->track);
         ri->track = NULL;
@@ -1989,6 +2222,27 @@ roformer_read(DB_fileinfo_t *_info, char *buffer, int nbytes) {
     }
 
     int read_bytes = 0;
+    if (ri->need_spawn && ri->pipe_fd < 0 && !ri->stream_finished) {
+            if (ri->cache_raw_path[0] || !ri->owns_temp_cache) {
+                char existing_raw[PATH_MAX] = {0};
+                if (find_existing_temp_raw_for_cache(ri->cache_final_path, existing_raw, sizeof(existing_raw)) == 0) {
+                    if (ri->cache_fp) {
+                        fclose(ri->cache_fp);
+                        ri->cache_fp = NULL;
+                    }
+                    ri->cache_fp = fopen(existing_raw, "rb");
+                    if (ri->cache_fp) {
+                        ri->need_spawn = 0;
+                        ri->using_cache = 1;
+                        struct stat rst = {0};
+                        if (stat(existing_raw, &rst) == 0 && S_ISREG(rst.st_mode)) {
+                            ri->cache_bytes_written = rst.st_size;
+                        }
+                        trace("roformer: using existing active temp cache %s\n", existing_raw);
+                    }
+                }
+            }
+    }
     if (ri->need_spawn && ri->pipe_fd < 0 && !ri->stream_finished) {
             DB_output_t *output = deadbeef->get_output();
             ddb_playback_state_t st = output ? output->state() : DDB_PLAYBACK_STATE_STOPPED;
@@ -2044,7 +2298,37 @@ roformer_read(DB_fileinfo_t *_info, char *buffer, int nbytes) {
         }
     }
 
-    if (ri->cache_fp) {
+    if (ri->stream_finished) {
+        if (!ri->cache_snd && ri->cache_valid && ri->cache_final_path[0]) {
+            open_cache_if_available(ri, ri->cache_final_path);
+        }
+        if (ri->cache_snd) {
+            sf_count_t frame = (sf_count_t)(ri->data_bytes_read / ri->bytes_per_frame);
+            if (sf_seek(ri->cache_snd, frame, SEEK_SET) >= 0) {
+                sf_count_t want_frames = aligned / ri->bytes_per_frame;
+                sf_count_t got_frames = sf_readf_float(ri->cache_snd, (float *)buffer, want_frames);
+                if (got_frames > 0) {
+                    read_bytes = (int)(got_frames * ri->bytes_per_frame);
+                }
+            }
+        }
+        else if (ri->cache_fp) {
+            int64_t avail = ri->cache_bytes_written - (ri->cache_data_offset + ri->data_bytes_read);
+            if (avail > 0) {
+                int to_read = aligned;
+                if ((int64_t)to_read > avail) {
+                    to_read = (int)(avail - (avail % ri->bytes_per_frame));
+                }
+                if (to_read > 0) {
+                    clearerr(ri->cache_fp);
+                    if (fseeko(ri->cache_fp, (off_t)(ri->cache_data_offset + ri->data_bytes_read), SEEK_SET) == 0) {
+                        read_bytes = (int)fread(buffer, 1, (size_t)to_read, ri->cache_fp);
+                    }
+                }
+            }
+        }
+    }
+    else if (ri->cache_fp) {
         int64_t avail = ri->cache_bytes_written - (ri->cache_data_offset + ri->data_bytes_read);
         if (avail > 0) {
             int to_read = aligned;
@@ -2089,7 +2373,7 @@ roformer_seek_sample(DB_fileinfo_t *_info, int sample) {
     if (!ri->stream_finished) {
         return sample == 0 ? 0 : -1;
     }
-    if (!ri->using_cache || !ri->cache_fp) {
+    if (!ri->using_cache || (!ri->cache_fp && !ri->cache_snd)) {
         if (ri->stream_finished && ri->cache_valid && !ri->using_cache && ri->cache_final_path[0]) {
             if (open_cache_if_available(ri, ri->cache_final_path) != 0) {
                 return sample == 0 ? 0 : -1;
@@ -2100,9 +2384,16 @@ roformer_seek_sample(DB_fileinfo_t *_info, int sample) {
             return sample == 0 ? 0 : -1;
         }
     }
-    off_t off = (off_t)ri->cache_data_offset + (off_t)sample * (off_t)ri->bytes_per_frame;
-    if (fseeko(ri->cache_fp, off, SEEK_SET) != 0) {
-        return -1;
+    if (ri->cache_snd) {
+        if (sf_seek(ri->cache_snd, (sf_count_t)sample, SEEK_SET) < 0) {
+            return -1;
+        }
+    }
+    else {
+        off_t off = (off_t)ri->cache_data_offset + (off_t)sample * (off_t)ri->bytes_per_frame;
+        if (fseeko(ri->cache_fp, off, SEEK_SET) != 0) {
+            return -1;
+        }
     }
     ri->data_bytes_read = (int64_t)sample * ri->bytes_per_frame;
     _info->readpos = (float)sample / (float)ri->samplerate;
@@ -2126,7 +2417,8 @@ roformer_start(void) {
     }
     cache_enforce_limit();
     cache_index_prune_invalid();
-    cache_remove_unindexed_wavs();
+    cache_remove_unindexed_mp3s();
+    cache_remove_stale_temp_files();
     try_install_gui_button();
     update_button_label();
     int mode = roformer_get_mode();
@@ -2171,7 +2463,7 @@ roformer_stop(void) {
     return 0;
 }
 
-static const char *exts[] = {"wav", NULL};
+static const char *exts[] = {"wav", "flac", "mp3", NULL};
 
 static const char settings_dlg[] =
     "property \"Mel-Band-Roformer-Vocal-Model directory\" file roformer.model_dir \"\";\n"

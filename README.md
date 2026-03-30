@@ -14,6 +14,8 @@ It can switch playback between:
 - Action: `Playback/Toggle Roformer Mode`.
 - Direct inference execution via `inference.py` streaming float32 PCM.
 - Cache in `/tmp/deadbeef-$UID-roformer-cache`.
+- Live raw temp caches (`*.f32tmp*`) are stored separately in `/tmp/deadbeef-$UID-roformer-cache-f32tmp` (lazy-created, cleaned on startup and exit).
+- Cache filename uses the original source filename stem (plus mode suffix): `<name>.instr.mp3` / `<name>.vocal.mp3`.
 - Cache directory is created lazily on first write (not on plugin load).
 - Persistent `index.txt` cache map across restarts.
 - Cache size limit in MB (`roformer.cache_limit_mb`, default 1024).
@@ -85,9 +87,9 @@ In DeaDBeeF plugin settings:
 
 ## Cache Format
 
-Cache files are WAV (`.wav`) with float32 PCM (`WAVE`, format code 3).
+Cache files are MP3 (`.mp3`) generated with model-side `--mp3`.
 
-Each cache file starts with a 44-byte WAV header and data chunk sizes are patched when inference completes successfully.
+During active streaming, roformer writes a temporary raw float32 cache file (`*.f32tmp`) for instant playback; after inference completes successfully it finalizes to MP3 and updates `index.txt`.
 
 `index.txt` schema:
 
@@ -100,12 +102,12 @@ Field notes:
 - `mtime`,`size`: source file stat used for cache key validity
 - `samplerate`,`channels`: playback format
 - `complete`: `1` means reusable complete cache, `0` incomplete
-- `cache_file`: absolute path to cache `.wav`
+- `cache_file`: absolute path to cache `.mp3`
 - `uri`: source track URI/path
 
 Only `complete=1` entries are used as cache hits.
 
-On startup, orphan `.wav` files not referenced by `index.txt` are removed.
+On startup, orphan `.mp3` files not referenced by `index.txt` are removed.
 
 If playback stops before inference completes, incomplete cache is removed.
 
