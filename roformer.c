@@ -1618,6 +1618,29 @@ cache_file_plausible(roformer_info_t *ri, const char *cache_path) {
     return st.st_size >= expected;
 }
 
+static int
+is_source_currently_playing(const char *source_uri) {
+    if (!source_uri || !source_uri[0]) {
+        return 0;
+    }
+    DB_playItem_t *playing = deadbeef->streamer_get_playing_track_safe();
+    if (!playing) {
+        return 0;
+    }
+    char playing_src[PATH_MAX] = {0};
+    deadbeef->pl_lock();
+    const char *src = deadbeef->pl_find_meta(playing, ":ROFORMER_SOURCE_URI");
+    if (!src) {
+        src = deadbeef->pl_find_meta(playing, ":URI");
+    }
+    if (src) {
+        strncpy(playing_src, src, sizeof(playing_src) - 1);
+    }
+    deadbeef->pl_unlock();
+    deadbeef->pl_item_unref(playing);
+    return playing_src[0] && !strcmp(playing_src, source_uri);
+}
+
 static DB_fileinfo_t *
 roformer_open(uint32_t hints) {
     (void)hints;
@@ -1766,6 +1789,13 @@ finish_stream(roformer_info_t *ri, int aborted) {
                 1,
                 ri->cache_final_path);
             trace("roformer: cache finalized %s\n", ri->cache_final_path);
+            if (is_source_currently_playing(ri->source_uri)) {
+                float cur = deadbeef->streamer_get_playpos();
+                if (cur < 0) {
+                    cur = 0;
+                }
+                deadbeef->sendmessage(DB_EV_SEEK, 0, (uint32_t)(cur * 1000.0f), 0);
+            }
         }
         else {
             unlink(ri->cache_final_path);
