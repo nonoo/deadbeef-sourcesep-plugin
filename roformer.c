@@ -23,6 +23,8 @@ extern char **environ;
 static DB_functions_t *deadbeef;
 static DB_decoder_t plugin;
 static int roformer_seek_sample(DB_fileinfo_t *_info, int sample);
+static int cache_index_lookup(const char *uri, int mode, int64_t mtime, int64_t size, int *samplerate, int *channels, char *cache_file_out, size_t out_sz);
+static void build_cache_key(DB_playItem_t *it, int mode, char *hex, size_t hex_sz);
 
 #define ROFORMER_MODE_ORIGINAL 0
 #define ROFORMER_MODE_INSTRUMENTAL 1
@@ -43,6 +45,7 @@ typedef struct {
     int using_cache;
     FILE *cache_fp;
     int64_t cache_bytes_written;
+    int64_t cache_data_offset;
 
     int pipe_fd;
     pid_t child_pid;
@@ -124,6 +127,8 @@ typedef struct {
 
 static GtkWidget *mode_button;
 static ddb_gtkui_t *gtkui_api;
+static volatile int precache_running;
+static volatile int precache_rescan;
 
 static DB_plugin_action_t mode_action;
 
@@ -342,6 +347,14 @@ path_has_wav_ext(const char *path) {
     }
     size_t n = strlen(path);
     return n >= 4 && !strcmp(path + n - 4, ".wav");
+}
+
+static int
+cache_has_complete_entry(const char *uri, int mode, int64_t mtime, int64_t size) {
+    int sr = 0;
+    int ch = 0;
+    char cache_file[PATH_MAX];
+    return cache_index_lookup(uri, mode, mtime, size, &sr, &ch, cache_file, sizeof(cache_file)) == 0;
 }
 
 static int
@@ -828,6 +841,170 @@ ensure_playing_track_mode(void) {
     deadbeef->pl_item_unref(it);
 }
 
+static void
+precache_single_track(DB_playItem_t *it, int mode) {
+    if (!it || mode == ROFORMER_MODE_ORIGINAL) {
+        return;
+    }
+    deadbeef->pl_lock();
+    const char *uri = deadbeef->pl_find_meta(it, ":URI");
+    char uri_copy[PATH_MAX] = {0};
+    if (uri) {
+        strncpy(uri_copy, uri, sizeof(uri_copy) - 1);
+    }
+    deadbeef->pl_unlock();
+    if (!uri_copy[0]) {
+        return;
+    }
+    int64_t mtime = 0;
+    int64_t size = 0;
+    get_uri_file_stat(uri_copy, &mtime, &size);
+    if (cache_has_complete_entry(uri_copy, mode, mtime, size)) {
+        return;
+    }
+
+    char cache_dir[PATH_MAX];
+    get_cache_dir(cache_dir, sizeof(cache_dir));
+    if (!cache_dir[0]) {
+        return;
+    }
+    char key[64];
+    build_cache_key(it, mode, key, sizeof(key));
+    char final_name[80];
+    if (snprintf(final_name, sizeof(final_name), "%s.wav", key) < 0) {
+        return;
+    }
+    char final_path[PATH_MAX];
+    if (safe_path_join2(final_path, sizeof(final_path), cache_dir, final_name) != 0) {
+        return;
+    }
+
+    if (cache_has_complete_entry(uri_copy, mode, mtime, size)) {
+        return;
+    }
+
+    char model_dir[PATH_MAX];
+    deadbeef->conf_get_str("roformer.model_dir", "", model_dir, sizeof(model_dir));
+    if (!model_dir[0] || normalize_model_dir(model_dir, sizeof(model_dir)) != 0) {
+        return;
+    }
+    char inference_path[PATH_MAX];
+    char config_path[PATH_MAX];
+    char model_path[PATH_MAX];
+    if (safe_path_join2(inference_path, sizeof(inference_path), model_dir, "inference.py") != 0
+        || safe_path_join2(config_path, sizeof(config_path), model_dir, "configs/config_vocals_mel_band_roformer.yaml") != 0
+        || safe_path_join2(model_path, sizeof(model_path), model_dir, "MelBandRoformer.ckpt") != 0) {
+        return;
+    }
+    const char *python = deadbeef->conf_get_str_fast("roformer.python", "python3");
+
+    char cmd[PATH_MAX * 8];
+    const char *out_name = mode == ROFORMER_MODE_VOCAL ? "_vocals.wav" : "_instrumental.wav";
+    if (snprintf(
+            cmd, sizeof(cmd),
+            "outdir=$(mktemp -d) && "
+            "base=$(basename \"$1\") && stem=${base%%.*} && "
+            "\"%s\" \"%s\" --config_path \"%s\" --model_path \"%s\" --input \"$1\" --store_dir \"$outdir\" >/dev/null 2>&1 && "
+            "src=\"$outdir/${stem}%s\" && [ -f \"$src\" ] && cp -f \"$src\" \"$2\"; "
+            "status=$?; rm -rf \"$outdir\"; exit $status",
+            python, inference_path, config_path, model_path, out_name) < 0) {
+        return;
+    }
+
+    pid_t pid = fork();
+    if (pid == 0) {
+        execl("/bin/sh", "sh", "-c", cmd, "sh", uri_copy, final_path, (char *)NULL);
+        _exit(127);
+    }
+    if (pid <= 0) {
+        return;
+    }
+    int status = 0;
+    waitpid(pid, &status, 0);
+    if (!(WIFEXITED(status) && WEXITSTATUS(status) == 0)) {
+        unlink(final_path);
+        return;
+    }
+    struct stat st = {0};
+    if (stat(final_path, &st) != 0 || !S_ISREG(st.st_mode) || st.st_size < WAV_HEADER_SIZE + 8) {
+        unlink(final_path);
+        return;
+    }
+    FILE *chk = fopen(final_path, "rb");
+    int sr = 44100;
+    int ch = 2;
+    if (chk) {
+        uint8_t hh[WAV_HEADER_SIZE];
+        if (fread(hh, 1, sizeof(hh), chk) == sizeof(hh) && !memcmp(hh + 0, "RIFF", 4) && !memcmp(hh + 8, "WAVE", 4)) {
+            ch = (int)(hh[22] | (hh[23] << 8));
+            sr = (int)le32_read(hh + 24);
+        }
+        fclose(chk);
+    }
+    cache_index_upsert(uri_copy, mode, mtime, size, sr, ch, 1, final_path);
+    cache_enforce_limit();
+}
+
+static void
+precache_worker(void *ctx) {
+    (void)ctx;
+    while (1) {
+        precache_rescan = 0;
+        int mode = roformer_get_mode();
+        if (mode == ROFORMER_MODE_ORIGINAL) {
+            break;
+        }
+        deadbeef->pl_lock();
+        ddb_playlist_t *plt = deadbeef->plt_get_curr();
+        deadbeef->pl_unlock();
+        if (!plt) {
+            break;
+        }
+        deadbeef->pl_lock();
+        DB_playItem_t *it = deadbeef->plt_get_first(plt, PL_MAIN);
+        deadbeef->pl_unlock();
+        while (it) {
+            precache_single_track(it, mode);
+            deadbeef->pl_lock();
+            DB_playItem_t *next = deadbeef->pl_get_next(it, PL_MAIN);
+            deadbeef->pl_unlock();
+            deadbeef->pl_item_unref(it);
+            it = next;
+            if (precache_rescan || roformer_get_mode() == ROFORMER_MODE_ORIGINAL) {
+                while (it) {
+                    deadbeef->pl_lock();
+                    DB_playItem_t *next2 = deadbeef->pl_get_next(it, PL_MAIN);
+                    deadbeef->pl_unlock();
+                    deadbeef->pl_item_unref(it);
+                    it = next2;
+                }
+                break;
+            }
+        }
+        deadbeef->plt_unref(plt);
+        if (!precache_rescan) {
+            break;
+        }
+    }
+    precache_running = 0;
+}
+
+static void
+schedule_precache_rescan(void) {
+    precache_rescan = 1;
+    if (precache_running || roformer_get_mode() == ROFORMER_MODE_ORIGINAL) {
+        return;
+    }
+    precache_running = 1;
+    intptr_t tid = deadbeef->thread_start_low_priority(precache_worker, NULL);
+    if (tid) {
+        deadbeef->thread_detach(tid);
+    }
+    else {
+        precache_running = 0;
+    }
+}
+
 static int
 cycle_mode(void) {
     int mode = roformer_get_mode();
@@ -836,6 +1013,7 @@ cycle_mode(void) {
     update_button_label();
     apply_mode_to_current_playlist(mode);
     restart_if_playing();
+    schedule_precache_rescan();
     return mode;
 }
 
@@ -1069,6 +1247,7 @@ spawn_inference(roformer_info_t *ri, const char *src_uri, int mode) {
     fflush(ri->cache_fp_write);
     trace("roformer: cache write opened path=%s\n", ri->cache_final_path);
     ri->cache_bytes_written = WAV_HEADER_SIZE;
+    ri->cache_data_offset = WAV_HEADER_SIZE;
     if (!ri->cache_fp) {
         ri->cache_fp = fopen(ri->cache_final_path, "rb");
         if (!ri->cache_fp) {
@@ -1093,26 +1272,65 @@ open_cache_if_available(roformer_info_t *ri, const char *cache_path) {
         fclose(fp);
         return -1;
     }
-    uint8_t h[WAV_HEADER_SIZE];
-    if (st.st_size < WAV_HEADER_SIZE || fread(h, 1, sizeof(h), fp) != sizeof(h)) {
+    uint8_t h[12];
+    if (st.st_size < 12 || fread(h, 1, sizeof(h), fp) != sizeof(h)) {
         fclose(fp);
         return -1;
     }
-    if (memcmp(h + 0, "RIFF", 4) || memcmp(h + 8, "WAVE", 4) || memcmp(h + 12, "fmt ", 4) || memcmp(h + 36, "data", 4)) {
+    if (memcmp(h + 0, "RIFF", 4) || memcmp(h + 8, "WAVE", 4)) {
         fclose(fp);
         return -1;
     }
-    int fmt = (int)(h[20] | (h[21] << 8));
-    int ch = (int)(h[22] | (h[23] << 8));
-    int sr = (int)le32_read(h + 24);
-    int bps = (int)(h[34] | (h[35] << 8));
-    if (fmt != 3 || bps != 32 || ch <= 0 || ch > 8 || sr <= 0 || sr != ri->samplerate || ch != ri->channels) {
+    int fmt = 0;
+    int ch = 0;
+    int sr = 0;
+    int bps = 0;
+    int64_t data_off = -1;
+    while (1) {
+        uint8_t chdr[8];
+        if (fread(chdr, 1, sizeof(chdr), fp) != sizeof(chdr)) {
+            break;
+        }
+        uint32_t csz = le32_read(chdr + 4);
+        off_t data_pos = ftello(fp);
+        if (!memcmp(chdr, "fmt ", 4)) {
+            uint8_t fmtbuf[40] = {0};
+            size_t need = csz < sizeof(fmtbuf) ? csz : sizeof(fmtbuf);
+            if (need < 16 || fread(fmtbuf, 1, need, fp) != need) {
+                fclose(fp);
+                return -1;
+            }
+            fmt = (int)(fmtbuf[0] | (fmtbuf[1] << 8));
+            ch = (int)(fmtbuf[2] | (fmtbuf[3] << 8));
+            sr = (int)le32_read(fmtbuf + 4);
+            bps = (int)(fmtbuf[14] | (fmtbuf[15] << 8));
+            off_t skip = (off_t)csz - (off_t)need;
+            if (skip > 0) {
+                fseeko(fp, skip, SEEK_CUR);
+            }
+        }
+        else if (!memcmp(chdr, "data", 4)) {
+            data_off = data_pos;
+            fseeko(fp, (off_t)csz, SEEK_CUR);
+        }
+        else {
+            fseeko(fp, (off_t)csz, SEEK_CUR);
+        }
+        if (csz & 1) {
+            fseeko(fp, 1, SEEK_CUR);
+        }
+        if (fmt && data_off >= 0) {
+            break;
+        }
+    }
+    if (fmt != 3 || bps != 32 || ch <= 0 || ch > 8 || sr <= 0 || sr != ri->samplerate || ch != ri->channels || data_off < 0) {
         fclose(fp);
         return -1;
     }
     ri->cache_fp = fp;
     ri->using_cache = 1;
     ri->cache_bytes_written = st.st_size;
+    ri->cache_data_offset = data_off;
     ri->stream_finished = 1;
     ri->cache_valid = 1;
     trace("roformer: cache hit %s\n", cache_path);
@@ -1430,18 +1648,18 @@ roformer_read(DB_fileinfo_t *_info, char *buffer, int nbytes) {
     }
 
     if (ri->pipe_fd >= 0) {
-        int64_t target = WAV_HEADER_SIZE + ri->data_bytes_read + ri->bytes_per_frame;
+        int64_t target = ri->cache_data_offset + ri->data_bytes_read + ri->bytes_per_frame;
         drain_pipe_to_cache(ri, target);
-        if (!ri->stream_finished && ri->cache_bytes_written <= WAV_HEADER_SIZE + ri->data_bytes_read) {
+        if (!ri->stream_finished && ri->cache_bytes_written <= ri->cache_data_offset + ri->data_bytes_read) {
             int tries = 0;
-            while (!ri->stream_finished && ri->cache_bytes_written <= WAV_HEADER_SIZE + ri->data_bytes_read && tries++ < 200) {
+            while (!ri->stream_finished && ri->cache_bytes_written <= ri->cache_data_offset + ri->data_bytes_read && tries++ < 200) {
                 struct pollfd pfd = {.fd = ri->pipe_fd, .events = POLLIN | POLLHUP | POLLERR, .revents = 0};
                 int pr = poll(&pfd, 1, 50);
                 if (pr < 0 && errno != EINTR) {
                     break;
                 }
-                drain_pipe_to_cache(ri, WAV_HEADER_SIZE + ri->data_bytes_read + ri->bytes_per_frame);
-                if (pr == 0 && ri->cache_bytes_written <= WAV_HEADER_SIZE + ri->data_bytes_read) {
+                drain_pipe_to_cache(ri, ri->cache_data_offset + ri->data_bytes_read + ri->bytes_per_frame);
+                if (pr == 0 && ri->cache_bytes_written <= ri->cache_data_offset + ri->data_bytes_read) {
                     continue;
                 }
             }
@@ -1449,7 +1667,7 @@ roformer_read(DB_fileinfo_t *_info, char *buffer, int nbytes) {
     }
 
     if (ri->cache_fp) {
-        int64_t avail = ri->cache_bytes_written - (WAV_HEADER_SIZE + ri->data_bytes_read);
+        int64_t avail = ri->cache_bytes_written - (ri->cache_data_offset + ri->data_bytes_read);
         if (avail > 0) {
             int to_read = aligned;
             if ((int64_t)to_read > avail) {
@@ -1457,7 +1675,7 @@ roformer_read(DB_fileinfo_t *_info, char *buffer, int nbytes) {
             }
             if (to_read > 0) {
                 clearerr(ri->cache_fp);
-                if (fseeko(ri->cache_fp, (off_t)(WAV_HEADER_SIZE + ri->data_bytes_read), SEEK_SET) == 0) {
+                if (fseeko(ri->cache_fp, (off_t)(ri->cache_data_offset + ri->data_bytes_read), SEEK_SET) == 0) {
                     read_bytes = (int)fread(buffer, 1, (size_t)to_read, ri->cache_fp);
                 }
             }
@@ -1504,7 +1722,7 @@ roformer_seek_sample(DB_fileinfo_t *_info, int sample) {
             return sample == 0 ? 0 : -1;
         }
     }
-    off_t off = (off_t)WAV_HEADER_SIZE + (off_t)sample * (off_t)ri->bytes_per_frame;
+    off_t off = (off_t)ri->cache_data_offset + (off_t)sample * (off_t)ri->bytes_per_frame;
     if (fseeko(ri->cache_fp, off, SEEK_SET) != 0) {
         return -1;
     }
@@ -1537,6 +1755,7 @@ roformer_start(void) {
     if (mode != ROFORMER_MODE_ORIGINAL) {
         apply_mode_to_current_playlist(mode);
     }
+    schedule_precache_rescan();
     return 0;
 }
 
@@ -1554,9 +1773,13 @@ roformer_message(uint32_t id, uintptr_t ctx, uint32_t p1, uint32_t p2) {
         }
         try_install_gui_button();
         update_button_label();
+        schedule_precache_rescan();
     }
     if (id == DB_EV_SONGSTARTED) {
         ensure_playing_track_mode();
+    }
+    if (id == DB_EV_PLAYLISTCHANGED) {
+        schedule_precache_rescan();
     }
     return 0;
 }
