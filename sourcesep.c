@@ -405,38 +405,6 @@ get_track_source_uri(DB_playItem_t *it, char *uri_out, size_t uri_out_sz) {
 }
 
 static int
-uri_in_current_playlist(const char *uri) {
-    if (!uri || !uri[0]) {
-        return 0;
-    }
-    deadbeef->pl_lock();
-    ddb_playlist_t *plt = deadbeef->plt_get_curr();
-    deadbeef->pl_unlock();
-    if (!plt) {
-        return 0;
-    }
-    deadbeef->pl_lock();
-    DB_playItem_t *it = deadbeef->plt_get_first(plt, PL_MAIN);
-    deadbeef->pl_unlock();
-    int found = 0;
-    while (it) {
-        char it_uri[PATH_MAX] = {0};
-        get_track_source_uri(it, it_uri, sizeof(it_uri));
-        deadbeef->pl_lock();
-        DB_playItem_t *next = deadbeef->pl_get_next(it, PL_MAIN);
-        deadbeef->pl_unlock();
-        deadbeef->pl_item_unref(it);
-        it = next;
-        if (it_uri[0] && !strcmp(it_uri, uri)) {
-            found = 1;
-            break;
-        }
-    }
-    deadbeef->plt_unref(plt);
-    return found;
-}
-
-static int
 uri_is_currently_playing_or_loaded(const char *uri) {
     if (!uri || !uri[0]) {
         return 0;
@@ -2186,30 +2154,33 @@ finish_stream(sourcesep_info_t *ri, int aborted) {
                 }
                 unlink(mp3_tmp_path);
                 convert_ok = 0;
-                if (!aborted && child_ok) {
-                    keep_raw_for_playback = 1;
-                }
             }
         }
-        else if (!aborted && child_ok) {
+
+        if (!aborted && child_ok) {
             keep_raw_for_playback = 1;
         }
 
-        if (!keep_raw_for_playback) {
-            if (ri->owns_temp_cache && ri->cache_raw_path[0] && unlink(ri->cache_raw_path) != 0 && errno != ENOENT) {
-                trace("sourcesep: failed to remove temp cache %s errno=%d\n", ri->cache_raw_path, errno);
-            }
-            ri->owns_temp_cache = 0;
-            ri->cache_raw_path[0] = 0;
-        }
         if (ri->cache_snd) {
             sf_close(ri->cache_snd);
             ri->cache_snd = NULL;
         }
 
-        if (!finalized && !keep_raw_for_playback && open_cache_if_available(ri, ri->cache_final_path) == 0) {
-            finalized = 1;
+        if (finalized) {
+            ri->cache_valid = 1;
+            ri->cache_data_offset = 0;
+            cache_index_upsert(
+                ri->source_uri,
+                ri->mode,
+                ri->source_mtime,
+                ri->source_size,
+                ri->samplerate,
+                ri->channels,
+                1,
+                ri->cache_final_path);
+            trace("sourcesep: cache finalized %s\n", ri->cache_final_path);
         }
+
         if (keep_raw_for_playback) {
             if (ri->cache_fp) {
                 fclose(ri->cache_fp);
@@ -2226,29 +2197,18 @@ finish_stream(sourcesep_info_t *ri, int aborted) {
                 }
             }
         }
-        if (finalized) {
-            if (ri->cache_fp) {
-                fclose(ri->cache_fp);
-                ri->cache_fp = NULL;
-            }
+        else {
             if (ri->owns_temp_cache && ri->cache_raw_path[0] && unlink(ri->cache_raw_path) != 0 && errno != ENOENT) {
                 trace("sourcesep: failed to remove temp cache %s errno=%d\n", ri->cache_raw_path, errno);
             }
             ri->owns_temp_cache = 0;
             ri->cache_raw_path[0] = 0;
-            ri->cache_valid = 1;
-            ri->cache_data_offset = 0;
-            cache_index_upsert(
-                ri->source_uri,
-                ri->mode,
-                ri->source_mtime,
-                ri->source_size,
-                ri->samplerate,
-                ri->channels,
-                1,
-                ri->cache_final_path);
-            trace("sourcesep: cache finalized %s\n", ri->cache_final_path);
         }
+
+        if (!finalized && !keep_raw_for_playback && open_cache_if_available(ri, ri->cache_final_path) == 0) {
+            finalized = 1;
+        }
+
         if (!aborted && child_ok) {
             notify_waveform_refresh_for_source(ri->source_uri);
         }
@@ -2387,37 +2347,7 @@ sourcesep_read(DB_fileinfo_t *_info, char *buffer, int nbytes) {
         }
     }
 
-    if (ri->stream_finished) {
-        if (!ri->cache_snd && ri->cache_valid && ri->cache_final_path[0]) {
-            open_cache_if_available(ri, ri->cache_final_path);
-        }
-        if (ri->cache_snd) {
-            sf_count_t frame = (sf_count_t)(ri->data_bytes_read / ri->bytes_per_frame);
-            if (sf_seek(ri->cache_snd, frame, SEEK_SET) >= 0) {
-                sf_count_t want_frames = aligned / ri->bytes_per_frame;
-                sf_count_t got_frames = sf_readf_float(ri->cache_snd, (float *)buffer, want_frames);
-                if (got_frames > 0) {
-                    read_bytes = (int)(got_frames * ri->bytes_per_frame);
-                }
-            }
-        }
-        else if (ri->cache_fp) {
-            int64_t avail = ri->cache_bytes_written - (ri->cache_data_offset + ri->data_bytes_read);
-            if (avail > 0) {
-                int to_read = aligned;
-                if ((int64_t)to_read > avail) {
-                    to_read = (int)(avail - (avail % ri->bytes_per_frame));
-                }
-                if (to_read > 0) {
-                    clearerr(ri->cache_fp);
-                    if (fseeko(ri->cache_fp, (off_t)(ri->cache_data_offset + ri->data_bytes_read), SEEK_SET) == 0) {
-                        read_bytes = (int)fread(buffer, 1, (size_t)to_read, ri->cache_fp);
-                    }
-                }
-            }
-        }
-    }
-    else if (ri->cache_fp) {
+    if (ri->cache_fp) {
         int64_t avail = ri->cache_bytes_written - (ri->cache_data_offset + ri->data_bytes_read);
         if (avail > 0) {
             int to_read = aligned;
@@ -2428,6 +2358,22 @@ sourcesep_read(DB_fileinfo_t *_info, char *buffer, int nbytes) {
                 clearerr(ri->cache_fp);
                 if (fseeko(ri->cache_fp, (off_t)(ri->cache_data_offset + ri->data_bytes_read), SEEK_SET) == 0) {
                     read_bytes = (int)fread(buffer, 1, (size_t)to_read, ri->cache_fp);
+                }
+            }
+        }
+    }
+
+    if (read_bytes <= 0 && ri->stream_finished) {
+        if (!ri->cache_snd && ri->cache_valid && ri->cache_final_path[0]) {
+            open_cache_if_available(ri, ri->cache_final_path);
+        }
+        if (ri->cache_snd) {
+            sf_count_t frame = (sf_count_t)(ri->data_bytes_read / ri->bytes_per_frame);
+            if (sf_seek(ri->cache_snd, frame, SEEK_SET) >= 0) {
+                sf_count_t want_frames = aligned / ri->bytes_per_frame;
+                sf_count_t got_frames = sf_readf_float(ri->cache_snd, (float *)buffer, want_frames);
+                if (got_frames > 0) {
+                    read_bytes = (int)(got_frames * ri->bytes_per_frame);
                 }
             }
         }
