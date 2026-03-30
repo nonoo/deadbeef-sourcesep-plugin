@@ -1,10 +1,8 @@
 CC ?= cc
 CFLAGS ?= -O2 -fPIC -std=c99 -Wall -Wextra
 
-DEADBEEF_DIR ?= ../deadbeef
-
 GTK_CFLAGS = $(shell pkg-config --cflags gtk+-3.0 2>/dev/null || echo "")
-INCLUDES = -I$(DEADBEEF_DIR)/include -I$(DEADBEEF_DIR)/plugins/gtkui $(GTK_CFLAGS)
+INCLUDES = -I/usr/include/deadbeef $(GTK_CFLAGS)
 LDFLAGS_SO = -shared
 LIBS = $(shell pkg-config --libs gtk+-3.0 2>/dev/null || echo "")
 
