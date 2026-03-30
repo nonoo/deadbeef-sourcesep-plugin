@@ -1301,6 +1301,11 @@ precache_single_track(DB_playItem_t *it, int mode) {
         return;
     }
 
+    int bitrate_mode = SF_BITRATE_MODE_CONSTANT;
+    sf_command(out, SFC_SET_BITRATE_MODE, &bitrate_mode, sizeof(bitrate_mode));
+    double bitrate_level = 0.0;
+    sf_command(out, SFC_SET_COMPRESSION_LEVEL, &bitrate_level, sizeof(bitrate_level));
+
     float buf[8192];
     ssize_t got;
     size_t frame_sz = ch * 4;
@@ -1674,6 +1679,11 @@ convert_raw_to_mp3(const char *raw_path, const char *mp3_path, int samplerate, i
         sf_close(in);
         return -1;
     }
+
+    int bitrate_mode = SF_BITRATE_MODE_CONSTANT;
+    sf_command(out, SFC_SET_BITRATE_MODE, &bitrate_mode, sizeof(bitrate_mode));
+    double bitrate_level = 0.0;
+    sf_command(out, SFC_SET_COMPRESSION_LEVEL, &bitrate_level, sizeof(bitrate_level));
 
     float buf[8192];
     sf_count_t read_frames;
