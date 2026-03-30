@@ -15,7 +15,8 @@ It can switch playback between:
 - Direct inference execution via `inference.py` streaming float32 PCM.
 - Cache in `/tmp/deadbeef-$UID-roformer-cache`.
 - Persistent `index.txt` cache map across restarts.
-- Cache size limit enforcement (1 GiB, oldest-first eviction).
+- Cache size limit in MB (`roformer.cache_limit_mb`, default 1024).
+- During precache overflow, oldest cache is evicted unless it belongs to the current playing entry or any entry after it in the current playlist; in that case precaching pauses.
 - Optional verbose logging to DeaDBeeF internal log (`roformer.trace=1`).
 
 ## Build
@@ -69,6 +70,7 @@ In DeaDBeeF plugin settings:
 - **Mel-Band-Roformer-Vocal-Model directory** (`roformer.model_dir`)
 - **Enable verbose logging** (`roformer.trace`, default off)
 - **Python executable** (`roformer.python`, default `python3`)
+- **Cache size limit (MB)** (`roformer.cache_limit_mb`, default `1024`)
 
 ## Modes and Behavior
 

@@ -25,6 +25,7 @@ static DB_decoder_t plugin;
 static int roformer_seek_sample(DB_fileinfo_t *_info, int sample);
 static int cache_index_lookup(const char *uri, int mode, int64_t mtime, int64_t size, int *samplerate, int *channels, char *cache_file_out, size_t out_sz);
 static void build_cache_key(DB_playItem_t *it, int mode, char *hex, size_t hex_sz);
+static void cache_index_rewrite_with_filter(const char *remove_cache_path);
 
 #define ROFORMER_MODE_ORIGINAL 0
 #define ROFORMER_MODE_INSTRUMENTAL 1
@@ -348,6 +349,160 @@ path_has_wav_ext(const char *path) {
     }
     size_t n = strlen(path);
     return n >= 4 && !strcmp(path + n - 4, ".wav");
+}
+
+static int
+cache_index_find_uri_by_cache_file(const char *cache_file, char *uri_out, size_t uri_out_sz) {
+    if (!cache_file || !uri_out || uri_out_sz == 0) {
+        return -1;
+    }
+    uri_out[0] = 0;
+    char index_path[PATH_MAX];
+    if (get_cache_index_path(index_path, sizeof(index_path)) != 0) {
+        return -1;
+    }
+    FILE *fp = fopen(index_path, "r");
+    if (!fp) {
+        return -1;
+    }
+    char line[PATH_MAX * 2];
+    cache_index_entry_t e;
+    int found = -1;
+    while (fgets(line, sizeof(line), fp)) {
+        if (index_parse_line(line, &e) != 0) {
+            continue;
+        }
+        if (!strcmp(e.cache_file, cache_file)) {
+            snprintf(uri_out, uri_out_sz, "%s", e.uri);
+            found = 0;
+            break;
+        }
+    }
+    fclose(fp);
+    return found;
+}
+
+static int
+uri_protected_from_precache_eviction(const char *uri) {
+    if (!uri || !uri[0]) {
+        return 0;
+    }
+    DB_playItem_t *playing = deadbeef->streamer_get_playing_track_safe();
+    char playing_uri[PATH_MAX] = {0};
+    if (playing) {
+        deadbeef->pl_lock();
+        const char *puri = deadbeef->pl_find_meta(playing, ":URI");
+        if (puri) {
+            strncpy(playing_uri, puri, sizeof(playing_uri) - 1);
+        }
+        deadbeef->pl_unlock();
+        deadbeef->pl_item_unref(playing);
+    }
+
+    deadbeef->pl_lock();
+    ddb_playlist_t *plt = deadbeef->plt_get_curr();
+    deadbeef->pl_unlock();
+    if (!plt) {
+        return 0;
+    }
+    deadbeef->pl_lock();
+    DB_playItem_t *it = deadbeef->plt_get_first(plt, PL_MAIN);
+    deadbeef->pl_unlock();
+    int found = 0;
+    int seen_playing = playing_uri[0] ? 0 : 1;
+    while (it) {
+        deadbeef->pl_lock();
+        const char *it_uri = deadbeef->pl_find_meta(it, ":URI");
+        char copy[PATH_MAX] = {0};
+        if (it_uri) {
+            strncpy(copy, it_uri, sizeof(copy) - 1);
+        }
+        deadbeef->pl_unlock();
+        if (!seen_playing && copy[0] && !strcmp(copy, playing_uri)) {
+            seen_playing = 1;
+        }
+        deadbeef->pl_lock();
+        DB_playItem_t *next = deadbeef->pl_get_next(it, PL_MAIN);
+        deadbeef->pl_unlock();
+        deadbeef->pl_item_unref(it);
+        it = next;
+        if (seen_playing && copy[0] && !strcmp(copy, uri)) {
+            found = 1;
+            break;
+        }
+    }
+    deadbeef->plt_unref(plt);
+    return found;
+}
+
+static int
+precache_make_room_or_stop(void) {
+    int limit_mb = deadbeef->conf_get_int("roformer.cache_limit_mb", CACHE_LIMIT_DEFAULT_MB);
+    if (limit_mb < 1) {
+        limit_mb = 1;
+    }
+    int64_t limit_bytes = (int64_t)limit_mb * 1024LL * 1024LL;
+    char cache_dir[PATH_MAX];
+    get_cache_dir(cache_dir, sizeof(cache_dir));
+    if (!cache_dir[0]) {
+        return 0;
+    }
+
+    while (1) {
+        DIR *dir = opendir(cache_dir);
+        if (!dir) {
+            return 0;
+        }
+        int64_t total = 0;
+        cache_entry_t oldest = {0};
+        int have_oldest = 0;
+        struct dirent *de;
+        while ((de = readdir(dir)) != NULL) {
+            if (de->d_name[0] == '.') {
+                continue;
+            }
+            if (!strcmp(de->d_name, "index.txt")) {
+                continue;
+            }
+            char full[PATH_MAX];
+            if (safe_path_join2(full, sizeof(full), cache_dir, de->d_name) != 0) {
+                continue;
+            }
+            struct stat st = {0};
+            if (stat(full, &st) != 0 || !S_ISREG(st.st_mode)) {
+                continue;
+            }
+            total += st.st_size;
+            if (!have_oldest || st.st_mtime < oldest.mtime) {
+                strncpy(oldest.path, full, sizeof(oldest.path) - 1);
+                oldest.path[sizeof(oldest.path) - 1] = 0;
+                oldest.mtime = st.st_mtime;
+                oldest.size = st.st_size;
+                have_oldest = 1;
+            }
+        }
+        closedir(dir);
+
+        if (total <= limit_bytes || !have_oldest) {
+            return 1;
+        }
+
+        char oldest_uri[PATH_MAX] = {0};
+        if (cache_index_find_uri_by_cache_file(oldest.path, oldest_uri, sizeof(oldest_uri)) == 0
+            && oldest_uri[0]
+            && uri_protected_from_precache_eviction(oldest_uri)) {
+            trace("roformer: precache paused, oldest cache is at/after current playing entry: %s\n", oldest_uri);
+            return 0;
+        }
+
+        if (unlink(oldest.path) == 0) {
+            cache_index_rewrite_with_filter(oldest.path);
+            trace("roformer: precache evicted oldest cache %s\n", oldest.path);
+        }
+        else {
+            return 0;
+        }
+    }
 }
 
 static int
@@ -853,6 +1008,9 @@ precache_single_track(DB_playItem_t *it, int mode) {
     if (!it || mode == ROFORMER_MODE_ORIGINAL) {
         return;
     }
+    if (!precache_make_room_or_stop()) {
+        return;
+    }
     deadbeef->pl_lock();
     const char *uri = deadbeef->pl_find_meta(it, ":URI");
     char uri_copy[PATH_MAX] = {0};
@@ -949,7 +1107,7 @@ precache_single_track(DB_playItem_t *it, int mode) {
         fclose(chk);
     }
     cache_index_upsert(uri_copy, mode, mtime, size, sr, ch, 1, final_path);
-    cache_enforce_limit();
+    (void)precache_make_room_or_stop();
 }
 
 static void
@@ -970,8 +1128,46 @@ precache_worker(void *ctx) {
         deadbeef->pl_lock();
         DB_playItem_t *it = deadbeef->plt_get_first(plt, PL_MAIN);
         deadbeef->pl_unlock();
+        DB_playItem_t *playing = deadbeef->streamer_get_playing_track_safe();
+        if (playing && it) {
+            int matched = 0;
+            while (it) {
+                if (it == playing) {
+                    matched = 1;
+                    break;
+                }
+                deadbeef->pl_lock();
+                DB_playItem_t *next_skip = deadbeef->pl_get_next(it, PL_MAIN);
+                deadbeef->pl_unlock();
+                deadbeef->pl_item_unref(it);
+                it = next_skip;
+            }
+            if (!matched) {
+                deadbeef->pl_lock();
+                it = deadbeef->plt_get_first(plt, PL_MAIN);
+                deadbeef->pl_unlock();
+            }
+        }
+        if (playing) {
+            deadbeef->pl_item_unref(playing);
+        }
         while (it) {
             precache_single_track(it, mode);
+            if (!precache_make_room_or_stop()) {
+                deadbeef->pl_lock();
+                DB_playItem_t *next_pause = deadbeef->pl_get_next(it, PL_MAIN);
+                deadbeef->pl_unlock();
+                deadbeef->pl_item_unref(it);
+                it = next_pause;
+                while (it) {
+                    deadbeef->pl_lock();
+                    DB_playItem_t *next_drop = deadbeef->pl_get_next(it, PL_MAIN);
+                    deadbeef->pl_unlock();
+                    deadbeef->pl_item_unref(it);
+                    it = next_drop;
+                }
+                break;
+            }
             deadbeef->pl_lock();
             DB_playItem_t *next = deadbeef->pl_get_next(it, PL_MAIN);
             deadbeef->pl_unlock();
@@ -1784,6 +1980,7 @@ roformer_message(uint32_t id, uintptr_t ctx, uint32_t p1, uint32_t p2) {
     }
     if (id == DB_EV_SONGSTARTED) {
         ensure_playing_track_mode();
+        schedule_precache_rescan();
     }
     if (id == DB_EV_PLAYLISTCHANGED) {
         schedule_precache_rescan();
