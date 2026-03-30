@@ -1305,6 +1305,15 @@ precache_single_track(DB_playItem_t *it, int mode) {
     ssize_t got;
     size_t frame_sz = ch * 4;
     while ((got = read(pipefd[0], buf, sizeof(buf))) > 0) {
+        if (uri_is_currently_playing_or_loaded(uri_copy)) {
+            trace("roformer: precache stopped, track started playing: %s\n", uri_copy);
+            close(pipefd[0]);
+            kill(pid, SIGTERM);
+            waitpid(pid, NULL, 0);
+            sf_close(out);
+            unlink(final_path);
+            return;
+        }
         sf_count_t frames = (sf_count_t)(got / frame_sz);
         if (frames > 0) {
             sf_writef_float(out, buf, frames);
