@@ -80,7 +80,7 @@ git clone https://github.com/nonoo/Music-Source-Separation-Training
 
 #### Plugin configuration
 
-In DeaDBeeF plugin settings, set **Vocal Separation Script** and **Instrumental Separation Script** to the path of `inference.py` (or your specific separation scripts) in that cloned directory.
+In DeaDBeeF plugin settings, set **Vocal Separation Script** and **Instrumental Separation Script** to the path of `run.sh` (or your specific separation scripts) in that cloned directory.
 
 ## Plugin Configuration
 
