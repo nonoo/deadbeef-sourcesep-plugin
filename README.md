@@ -2,6 +2,8 @@
 
 `sourcesep.so` is an out-of-tree DeaDBeeF decoder plugin that plays source-separated output.
 
+[![Watch the video](https://img.youtube.com/vi/t0HQaPewfdw/0.jpg)](https://youtu.be/t0HQaPewfdw)
+
 It can switch playback between:
 - original source (`🔊`)
 - instrumental (`🎸`)
