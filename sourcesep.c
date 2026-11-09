@@ -16,6 +16,8 @@
 #include <fcntl.h>
 #include <poll.h>
 #include <ctype.h>
+#include <pthread.h>
+#include <time.h>
 #include <sndfile.h>
 
 #include <gtkui_api.h>
@@ -24,6 +26,7 @@ extern char **environ;
 
 static DB_functions_t *deadbeef;
 static DB_decoder_t plugin;
+static pthread_mutex_t cache_index_lock = PTHREAD_MUTEX_INITIALIZER;
 static float restart_pos = -1.0f;
 static char restart_uri[PATH_MAX] = {0};
 
@@ -31,11 +34,15 @@ static int sourcesep_seek_sample(DB_fileinfo_t *_info, int sample);
 static int get_samplerate(DB_playItem_t *it);
 static int get_separation_samplerate(DB_playItem_t *it, int mode);
 static int get_channels(DB_playItem_t *it);
+static int use_combined_separation(void);
+static const char *get_separation_script_key(int mode);
+static const char *get_separation_samplerate_key(int mode);
 static void notify_waveform_refresh_for_source(const char *source_uri);
 static int uri_protected_from_precache_eviction(const char *uri);
-static int cache_index_lookup(const char *uri, int mode, int64_t mtime, int64_t size, int expected_samplerate, int *samplerate, int *channels, char *cache_file_out, size_t out_sz);
+static int cache_index_lookup(const char *uri, int mode, int64_t mtime, int64_t size, int expected_samplerate, const char *expected_cache_file, int *samplerate, int *channels, char *cache_file_out, size_t out_sz);
 static int resolve_cache_final_path(DB_playItem_t *it, int mode, char *out, size_t out_sz);
 static void cache_index_rewrite_with_filter(const char *remove_cache_path, int mode);
+static void cache_index_rewrite_with_filter_locked(const char *remove_cache_path, int mode);
 static int convert_raw_to_mp3(const char *raw_path, const char *mp3_path, int samplerate, int channels);
 
 #define SOURCESEP_MODE_ORIGINAL 0
@@ -52,6 +59,8 @@ typedef struct {
     char line[INFERENCE_STDERR_LINE_MAX];
     size_t line_len;
 } inference_stderr_t;
+
+typedef struct combined_job combined_job_t;
 
 typedef struct {
     DB_fileinfo_t info;
@@ -80,12 +89,22 @@ typedef struct {
     int stream_finished;
     int cache_valid;
     int need_spawn;
+    int combined;
+    combined_job_t *combined_job;
     char source_uri[PATH_MAX];
     int64_t source_mtime;
     int64_t source_size;
 } sourcesep_info_t;
 
 static void finish_stream(sourcesep_info_t *ri, int aborted);
+static combined_job_t *combined_job_find(DB_playItem_t *it, int mode, int samplerate, int channels);
+static combined_job_t *combined_job_find_or_start(DB_playItem_t *it, int mode, int samplerate, int channels);
+static int combined_job_attach(sourcesep_info_t *ri, combined_job_t *job);
+static void combined_job_unref(combined_job_t *job);
+static int64_t combined_job_wait_bytes(combined_job_t *job, int mode, int64_t target, int timeout_ms, int *finished);
+static int64_t combined_job_bytes(combined_job_t *job, int mode);
+static int combined_job_wait_finished(combined_job_t *job, int timeout_ms);
+static void combined_jobs_shutdown(void);
 
 typedef struct {
     char path[PATH_MAX];
@@ -167,6 +186,19 @@ inference_stderr_close(inference_stderr_t *st) {
         close(st->fd);
         st->fd = -1;
     }
+}
+
+static int
+move_fd_above_stdio(int fd) {
+    if (fd < 0) {
+        return -1;
+    }
+    int hi = fcntl(fd, F_DUPFD, 10);
+    if (hi < 0) {
+        return -1;
+    }
+    close(fd);
+    return hi;
 }
 
 static const char *
@@ -645,15 +677,15 @@ precache_make_room_or_stop(void) {
 }
 
 static int
-cache_has_complete_entry(const char *uri, int mode, int64_t mtime, int64_t size, int expected_samplerate) {
+cache_has_complete_entry(const char *uri, int mode, int64_t mtime, int64_t size, int expected_samplerate, const char *expected_cache_file) {
     int sr = 0;
     int ch = 0;
     char cache_file[PATH_MAX];
-    return cache_index_lookup(uri, mode, mtime, size, expected_samplerate, &sr, &ch, cache_file, sizeof(cache_file)) == 0;
+    return cache_index_lookup(uri, mode, mtime, size, expected_samplerate, expected_cache_file, &sr, &ch, cache_file, sizeof(cache_file)) == 0;
 }
 
 static int
-cache_index_lookup(const char *uri, int mode, int64_t mtime, int64_t size, int expected_samplerate, int *samplerate, int *channels, char *cache_file_out, size_t out_sz) {
+cache_index_lookup(const char *uri, int mode, int64_t mtime, int64_t size, int expected_samplerate, const char *expected_cache_file, int *samplerate, int *channels, char *cache_file_out, size_t out_sz) {
     char index_path[PATH_MAX];
     if (get_cache_index_path(index_path, sizeof(index_path)) != 0) {
         return -1;
@@ -674,6 +706,9 @@ cache_index_lookup(const char *uri, int mode, int64_t mtime, int64_t size, int e
         }
         if (e.mode == mode && e.mtime == mtime && e.size == size && !strcmp(e.uri, uri)) {
             if (!e.complete) {
+                continue;
+            }
+            if (expected_cache_file && expected_cache_file[0] && strcmp(e.cache_file, expected_cache_file)) {
                 continue;
             }
             if (expected_samplerate > 0 && e.samplerate != expected_samplerate) {
@@ -701,7 +736,7 @@ cache_index_lookup(const char *uri, int mode, int64_t mtime, int64_t size, int e
 }
 
 static void
-cache_index_rewrite_with_filter(const char *remove_cache_path, int mode) {
+cache_index_rewrite_with_filter_locked(const char *remove_cache_path, int mode) {
     char index_path[PATH_MAX];
     char cache_dir[PATH_MAX];
     if (get_cache_index_path(index_path, sizeof(index_path)) != 0) {
@@ -761,6 +796,13 @@ cache_index_rewrite_with_filter(const char *remove_cache_path, int mode) {
 }
 
 static void
+cache_index_rewrite_with_filter(const char *remove_cache_path, int mode) {
+    pthread_mutex_lock(&cache_index_lock);
+    cache_index_rewrite_with_filter_locked(remove_cache_path, mode);
+    pthread_mutex_unlock(&cache_index_lock);
+}
+
+static void
 cache_index_upsert(const char *uri, int mode, int64_t mtime, int64_t size, int samplerate, int channels, int complete, const char *cache_file) {
     char cache_dir[PATH_MAX];
     get_cache_dir(cache_dir, sizeof(cache_dir));
@@ -768,13 +810,16 @@ cache_index_upsert(const char *uri, int mode, int64_t mtime, int64_t size, int s
         return;
     }
     ensure_dir(cache_dir);
-    cache_index_rewrite_with_filter(cache_file, mode);
+    pthread_mutex_lock(&cache_index_lock);
+    cache_index_rewrite_with_filter_locked(cache_file, mode);
     char index_path[PATH_MAX];
     if (get_cache_index_path(index_path, sizeof(index_path)) != 0) {
+        pthread_mutex_unlock(&cache_index_lock);
         return;
     }
     FILE *fp = fopen(index_path, "a");
     if (!fp) {
+        pthread_mutex_unlock(&cache_index_lock);
         return;
     }
     struct stat st = {0};
@@ -784,6 +829,7 @@ cache_index_upsert(const char *uri, int mode, int64_t mtime, int64_t size, int s
     fprintf(fp, "%s\t%lld\t%lld\t%d\t%d\t%d\t%s\t%s\n",
         mode_to_token(mode), (long long)mtime, (long long)size, samplerate, channels, complete, cache_file, uri);
     fclose(fp);
+    pthread_mutex_unlock(&cache_index_lock);
     trace("sourcesep: index upsert mode=%d sr=%d ch=%d complete=%d mtime=%lld size=%lld cache=%s uri=%s\n",
         mode, samplerate, channels, complete, (long long)mtime, (long long)size, cache_file, uri);
 }
@@ -1273,9 +1319,6 @@ precache_single_track(DB_playItem_t *it, int mode) {
     if (!it || mode == SOURCESEP_MODE_ORIGINAL) {
         return;
     }
-    if (!precache_make_room_or_stop()) {
-        return;
-    }
     deadbeef->pl_lock();
     const char *uri = deadbeef->pl_find_meta(it, ":URI");
     char uri_copy[PATH_MAX] = {0};
@@ -1291,7 +1334,42 @@ precache_single_track(DB_playItem_t *it, int mode) {
     get_uri_file_stat(uri_copy, &mtime, &size);
     int sr = get_separation_samplerate(it, mode);
     int ch = get_channels(it);
-    if (cache_has_complete_entry(uri_copy, mode, mtime, size, sr)) {
+
+    if (use_combined_separation()) {
+        char vocal_final[PATH_MAX];
+        char instr_final[PATH_MAX];
+        if (resolve_cache_final_path(it, SOURCESEP_MODE_VOCAL, vocal_final, sizeof(vocal_final)) != 0
+            || resolve_cache_final_path(it, SOURCESEP_MODE_INSTRUMENTAL, instr_final, sizeof(instr_final)) != 0) {
+            return;
+        }
+        int vocal_hit = cache_has_complete_entry(uri_copy, SOURCESEP_MODE_VOCAL, mtime, size, sr, vocal_final);
+        int instr_hit = cache_has_complete_entry(uri_copy, SOURCESEP_MODE_INSTRUMENTAL, mtime, size, sr, instr_final);
+        if (vocal_hit && instr_hit) {
+            return;
+        }
+        if (!precache_make_room_or_stop()) {
+            return;
+        }
+        combined_job_t *job = combined_job_find_or_start(it, mode, sr, ch);
+        if (!job) {
+            return;
+        }
+        int ok = combined_job_wait_finished(job, 0);
+        combined_job_unref(job);
+        trace("sourcesep: combined precache %s for %s (vocal_hit=%d instr_hit=%d)\n",
+            ok ? "finished" : "failed", uri_copy, vocal_hit, instr_hit);
+        (void)precache_make_room_or_stop();
+        return;
+    }
+
+    if (!precache_make_room_or_stop()) {
+        return;
+    }
+    char final_path[PATH_MAX];
+    if (resolve_cache_final_path(it, mode, final_path, sizeof(final_path)) != 0) {
+        return;
+    }
+    if (cache_has_complete_entry(uri_copy, mode, mtime, size, sr, final_path)) {
         return;
     }
     if (uri_is_currently_playing_or_loaded(uri_copy)) {
@@ -1304,12 +1382,8 @@ precache_single_track(DB_playItem_t *it, int mode) {
         return;
     }
     ensure_dir(cache_dir);
-    char final_path[PATH_MAX];
-    if (resolve_cache_final_path(it, mode, final_path, sizeof(final_path)) != 0) {
-        return;
-    }
 
-    if (cache_has_complete_entry(uri_copy, mode, mtime, size, sr)) {
+    if (cache_has_complete_entry(uri_copy, mode, mtime, size, sr, final_path)) {
         return;
     }
     if (uri_is_currently_playing_or_loaded(uri_copy)) {
@@ -1317,7 +1391,7 @@ precache_single_track(DB_playItem_t *it, int mode) {
     }
 
     char script[PATH_MAX];
-    const char *script_key = mode == SOURCESEP_MODE_VOCAL ? "sourcesep.vocal_separation_script" : "sourcesep.instrumental_separation_script";
+    const char *script_key = get_separation_script_key(mode);
     deadbeef->conf_get_str(script_key, "", script, sizeof(script));
     if (!script[0]) {
         return;
@@ -1680,10 +1754,38 @@ get_samplerate(DB_playItem_t *it) {
 }
 
 static int
+use_combined_separation(void) {
+    if (!deadbeef->conf_get_int("sourcesep.vocals_from_instrumental_script", 0)) {
+        return 0;
+    }
+    char script[PATH_MAX] = {0};
+    deadbeef->conf_get_str("sourcesep.instrumental_separation_script", "", script, sizeof(script));
+    return script[0] != 0;
+}
+
+static int
+separation_uses_instrumental_settings(int mode) {
+    return mode == SOURCESEP_MODE_INSTRUMENTAL ||
+        (mode == SOURCESEP_MODE_VOCAL && use_combined_separation());
+}
+
+static const char *
+get_separation_script_key(int mode) {
+    return mode == SOURCESEP_MODE_INSTRUMENTAL ?
+        "sourcesep.instrumental_separation_script" :
+        "sourcesep.vocal_separation_script";
+}
+
+static const char *
+get_separation_samplerate_key(int mode) {
+    return separation_uses_instrumental_settings(mode) ?
+        "sourcesep.instrumental_separation_samplerate" :
+        "sourcesep.vocal_separation_samplerate";
+}
+
+static int
 get_separation_samplerate(DB_playItem_t *it, int mode) {
-    const char *key = mode == SOURCESEP_MODE_VOCAL ?
-        "sourcesep.vocal_separation_samplerate" :
-        "sourcesep.instrumental_separation_samplerate";
+    const char *key = get_separation_samplerate_key(mode);
     int sr = deadbeef->conf_get_int(key, 0);
     if (sr <= 0) {
         sr = get_samplerate(it);
@@ -1769,8 +1871,16 @@ build_cache_filename(DB_playItem_t *it, int mode, char *name_out, size_t name_ou
         snprintf(safe_stem, sizeof(safe_stem), "track");
     }
 
-    const char *suffix = mode == SOURCESEP_MODE_VOCAL ? ".vocal.mp3" : ".instr.mp3";
-    snprintf(name_out, name_out_sz, "%s%s", safe_stem, suffix);
+    const char *suffix = ".instr.mp3";
+    if (mode == SOURCESEP_MODE_VOCAL) {
+        suffix = use_combined_separation() ? ".vocal-instr.mp3" : ".vocal.mp3";
+    }
+    size_t suffix_len = strlen(suffix);
+    if (name_out_sz <= suffix_len) {
+        name_out[0] = 0;
+        return;
+    }
+    snprintf(name_out, name_out_sz, "%.*s%s", (int)(name_out_sz - suffix_len - 1), safe_stem, suffix);
 }
 
 static int
@@ -1847,7 +1957,7 @@ spawn_inference(sourcesep_info_t *ri, const char *src_uri, int mode) {
     }
 
     char script[PATH_MAX];
-    const char *script_key = mode == SOURCESEP_MODE_VOCAL ? "sourcesep.vocal_separation_script" : "sourcesep.instrumental_separation_script";
+    const char *script_key = get_separation_script_key(mode);
     deadbeef->conf_get_str(script_key, "", script, sizeof(script));
     if (!script[0]) {
         return -1;
@@ -1886,18 +1996,32 @@ spawn_inference(sourcesep_info_t *ri, const char *src_uri, int mode) {
     }
 
     if (pid == 0) {
+        int stdout_fd = move_fd_above_stdio(pipefd[1]);
+        int stderr_fd = -1;
+        if (stdout_fd < 0) {
+            _exit(127);
+        }
         close(pipefd[0]);
-        dup2(pipefd[1], STDOUT_FILENO);
-        close(pipefd[1]);
-
         if (forward_stderr) {
+            stderr_fd = move_fd_above_stdio(errpipe[1]);
+            if (stderr_fd < 0) {
+                _exit(127);
+            }
             close(errpipe[0]);
-            dup2(errpipe[1], STDERR_FILENO);
-            close(errpipe[1]);
+        }
+        if (dup2(stdout_fd, STDOUT_FILENO) < 0) {
+            _exit(127);
+        }
+        close(stdout_fd);
+        if (forward_stderr) {
+            if (dup2(stderr_fd, STDERR_FILENO) < 0) {
+                _exit(127);
+            }
+            close(stderr_fd);
         }
         else {
             int devnull = open("/dev/null", O_WRONLY);
-            if (devnull >= 0) {
+            if (devnull >= 0 && devnull != STDERR_FILENO) {
                 dup2(devnull, STDERR_FILENO);
                 close(devnull);
             }
@@ -2136,6 +2260,7 @@ sourcesep_init(DB_fileinfo_t *_info, DB_playItem_t *it) {
         trace("sourcesep: init passthrough for %s\n", ri->source_uri);
         return -1;
     }
+    ri->combined = use_combined_separation();
 
     char cache_dir[PATH_MAX];
     get_cache_dir(cache_dir, sizeof(cache_dir));
@@ -2162,12 +2287,17 @@ sourcesep_init(DB_fileinfo_t *_info, DB_playItem_t *it) {
         ri->mode, ri->source_uri, (long long)ri->source_mtime, (long long)ri->source_size);
 
     int separation_sr = get_separation_samplerate(it, ri->mode);
+    char expected_cache[PATH_MAX];
+    if (resolve_cache_final_path(it, ri->mode, expected_cache, sizeof(expected_cache)) != 0) {
+        return -1;
+    }
     if (cache_index_lookup(
             ri->source_uri,
             ri->mode,
             ri->source_mtime,
             ri->source_size,
             separation_sr,
+            expected_cache,
             &ri->samplerate,
             &ri->channels,
             ri->cache_final_path,
@@ -2177,15 +2307,32 @@ sourcesep_init(DB_fileinfo_t *_info, DB_playItem_t *it) {
     else {
         ri->samplerate = separation_sr;
         ri->channels = get_channels(it);
-        if (resolve_cache_final_path(it, ri->mode, ri->cache_final_path, sizeof(ri->cache_final_path)) != 0) {
-            return -1;
-        }
+        snprintf(ri->cache_final_path, sizeof(ri->cache_final_path), "%s", expected_cache);
     }
     ri->bytes_per_frame = ri->channels * 4;
     trace("sourcesep: init format sr=%d ch=%d bpf=%d cache_final=%s\n",
         ri->samplerate, ri->channels, ri->bytes_per_frame, ri->cache_final_path);
 
     if (open_cache_if_available(ri, ri->cache_final_path) != 0 || !cache_file_plausible(ri, ri->cache_final_path)) {
+        if (ri->combined) {
+            if (ri->cache_snd) {
+                sf_close(ri->cache_snd);
+                ri->cache_snd = NULL;
+            }
+            ri->cache_valid = 0;
+            ri->using_cache = 0;
+            ri->stream_finished = 0;
+            combined_job_t *job = combined_job_find(it, ri->mode, ri->samplerate, ri->channels);
+            if (job) {
+                if (combined_job_attach(ri, job) == 0) {
+                    trace("sourcesep: init attached to combined job %s\n", ri->cache_raw_path);
+                    goto init_done;
+                }
+            }
+            trace("sourcesep: combined cache miss %s, deferring combined spawn\n", ri->cache_final_path);
+            ri->need_spawn = 1;
+            goto init_done;
+        }
         char existing_raw[PATH_MAX] = {0};
         if (find_existing_temp_raw_for_cache(ri->cache_final_path, existing_raw, sizeof(existing_raw)) == 0) {
             ri->need_spawn = 0;
@@ -2230,6 +2377,7 @@ sourcesep_init(DB_fileinfo_t *_info, DB_playItem_t *it) {
         trace("sourcesep: defer spawn need_spawn=1\n");
     }
 
+init_done:
     _info->plugin = &plugin;
     _info->fmt.channels = ri->channels;
     _info->fmt.bps = 32;
@@ -2252,46 +2400,774 @@ typedef struct {
     int mode;
 } cache_finalize_task_t;
 
+static int
+finalize_raw_cache(const char *raw_path, const char *final_path, int samplerate, int channels,
+    const char *source_uri, int64_t source_mtime, int64_t source_size, int mode) {
+    char mp3_tmp_path[PATH_MAX];
+    if (snprintf(mp3_tmp_path, sizeof(mp3_tmp_path), "%s.mp3tmp.%d.%llx",
+            final_path, (int)getpid(), (unsigned long long)(uintptr_t)raw_path) < 0) {
+        return -1;
+    }
+    if (convert_raw_to_mp3(raw_path, mp3_tmp_path, samplerate, channels) != 0) {
+        unlink(mp3_tmp_path);
+        trace("sourcesep: failed to convert raw to mp3 %s\n", raw_path);
+        return -1;
+    }
+    struct stat st = {0};
+    if (stat(mp3_tmp_path, &st) != 0 || !S_ISREG(st.st_mode) || st.st_size < 64) {
+        trace("sourcesep: mp3 temp too small %s\n", mp3_tmp_path);
+        unlink(mp3_tmp_path);
+        return -1;
+    }
+    if (rename(mp3_tmp_path, final_path) != 0) {
+        trace("sourcesep: failed to rename %s -> %s errno=%d\n", mp3_tmp_path, final_path, errno);
+        unlink(mp3_tmp_path);
+        return -1;
+    }
+    cache_index_upsert(
+        source_uri, mode, source_mtime, source_size,
+        samplerate, channels, 1, final_path);
+    notify_waveform_refresh_for_source(source_uri);
+    return 0;
+}
+
 static void
 background_finalize_cache(void *ctx) {
     cache_finalize_task_t *task = (cache_finalize_task_t *)ctx;
-    char mp3_tmp_path[PATH_MAX];
-    if (snprintf(mp3_tmp_path, sizeof(mp3_tmp_path), "%s.mp3tmp.%d.%llx",
-            task->final_path, (int)getpid(), (unsigned long long)(uintptr_t)task) < 0) {
-        free(task);
+    if (finalize_raw_cache(
+            task->raw_path,
+            task->final_path,
+            task->samplerate,
+            task->channels,
+            task->source_uri,
+            task->source_mtime,
+            task->source_size,
+            task->mode) == 0) {
+        trace("sourcesep: background cache finalized %s\n", task->final_path);
+    }
+    free(task);
+}
+
+struct combined_job {
+    struct combined_job *next;
+    pthread_mutex_t lock;
+    pthread_cond_t cond;
+    int refs;
+    int finished;
+    int aborted;
+    int success;
+    int samplerate;
+    int channels;
+    int64_t source_mtime;
+    int64_t source_size;
+    char source_uri[PATH_MAX];
+    char vocal_final[PATH_MAX];
+    char instr_final[PATH_MAX];
+    char vocal_raw[PATH_MAX];
+    char instr_raw[PATH_MAX];
+    int vocal_pipe;
+    int instr_pipe;
+    pid_t pid;
+    inference_stderr_t stderr_log;
+    FILE *vocal_write;
+    FILE *instr_write;
+    int64_t vocal_bytes;
+    int64_t instr_bytes;
+    pthread_t thread;
+};
+
+static pthread_mutex_t combined_jobs_lock = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t combined_jobs_cond = PTHREAD_COND_INITIALIZER;
+static combined_job_t *combined_jobs;
+static int combined_thread_count;
+static int combined_jobs_stopping;
+
+static void
+timespec_add_ms(struct timespec *ts, int ms) {
+    ts->tv_sec += ms / 1000;
+    ts->tv_nsec += (long)(ms % 1000) * 1000000L;
+    if (ts->tv_nsec >= 1000000000L) {
+        ts->tv_sec++;
+        ts->tv_nsec -= 1000000000L;
+    }
+}
+
+static void
+combined_job_ref(combined_job_t *job) {
+    pthread_mutex_lock(&job->lock);
+    job->refs++;
+    pthread_mutex_unlock(&job->lock);
+}
+
+static void
+combined_job_unref(combined_job_t *job) {
+    if (!job) {
         return;
     }
+    pthread_mutex_lock(&job->lock);
+    int refs = --job->refs;
+    pthread_mutex_unlock(&job->lock);
+    if (refs > 0) {
+        return;
+    }
+    if (job->vocal_raw[0]) {
+        unlink(job->vocal_raw);
+    }
+    if (job->instr_raw[0]) {
+        unlink(job->instr_raw);
+    }
+    pthread_mutex_destroy(&job->lock);
+    pthread_cond_destroy(&job->cond);
+    free(job);
+}
 
-    if (convert_raw_to_mp3(task->raw_path, mp3_tmp_path, task->samplerate, task->channels) == 0) {
-        struct stat st = {0};
-        if (stat(mp3_tmp_path, &st) == 0 && S_ISREG(st.st_mode) && st.st_size >= 64) {
-            if (rename(mp3_tmp_path, task->final_path) == 0) {
-                cache_index_upsert(
-                    task->source_uri,
-                    task->mode,
-                    task->source_mtime,
-                    task->source_size,
-                    task->samplerate,
-                    task->channels,
-                    1,
-                    task->final_path);
-                trace("sourcesep: background cache finalized %s\n", task->final_path);
-                notify_waveform_refresh_for_source(task->source_uri);
+static void
+combined_job_remove_from_list(combined_job_t *job) {
+    pthread_mutex_lock(&combined_jobs_lock);
+    combined_job_t **pp = &combined_jobs;
+    while (*pp && *pp != job) {
+        pp = &(*pp)->next;
+    }
+    if (*pp) {
+        *pp = job->next;
+    }
+    pthread_cond_broadcast(&combined_jobs_cond);
+    pthread_mutex_unlock(&combined_jobs_lock);
+}
+
+static void
+combined_job_close_pipes(combined_job_t *job) {
+    if (job->vocal_pipe >= 0) {
+        close(job->vocal_pipe);
+        job->vocal_pipe = -1;
+    }
+    if (job->instr_pipe >= 0) {
+        close(job->instr_pipe);
+        job->instr_pipe = -1;
+    }
+}
+
+static void
+combined_job_free_unstarted(combined_job_t *job) {
+    if (job->pid > 0) {
+        kill(job->pid, SIGKILL);
+        waitpid(job->pid, NULL, 0);
+        job->pid = 0;
+    }
+    combined_job_close_pipes(job);
+    inference_stderr_close(&job->stderr_log);
+    if (job->vocal_write) {
+        fclose(job->vocal_write);
+        job->vocal_write = NULL;
+    }
+    if (job->instr_write) {
+        fclose(job->instr_write);
+        job->instr_write = NULL;
+    }
+    if (job->vocal_raw[0]) {
+        unlink(job->vocal_raw);
+    }
+    if (job->instr_raw[0]) {
+        unlink(job->instr_raw);
+    }
+    pthread_mutex_destroy(&job->lock);
+    pthread_cond_destroy(&job->cond);
+    free(job);
+}
+
+static combined_job_t *
+combined_job_find_locked(const char *uri, int64_t mtime, int64_t size,
+    int samplerate, int channels, const char *vocal_final, const char *instr_final) {
+    for (combined_job_t *job = combined_jobs; job; job = job->next) {
+        if (!strcmp(job->source_uri, uri)
+            && job->source_mtime == mtime
+            && job->source_size == size
+            && job->samplerate == samplerate
+            && job->channels == channels
+            && !strcmp(job->vocal_final, vocal_final)
+            && !strcmp(job->instr_final, instr_final)) {
+            return job;
+        }
+    }
+    return NULL;
+}
+
+static combined_job_t *
+combined_job_find(DB_playItem_t *it, int mode, int samplerate, int channels) {
+    (void)mode;
+    char uri[PATH_MAX] = {0};
+    get_track_source_uri(it, uri, sizeof(uri));
+    if (!uri[0]) {
+        return NULL;
+    }
+    int64_t mtime = 0;
+    int64_t size = 0;
+    get_uri_file_stat(uri, &mtime, &size);
+    char vocal_final[PATH_MAX];
+    char instr_final[PATH_MAX];
+    if (resolve_cache_final_path(it, SOURCESEP_MODE_VOCAL, vocal_final, sizeof(vocal_final)) != 0
+        || resolve_cache_final_path(it, SOURCESEP_MODE_INSTRUMENTAL, instr_final, sizeof(instr_final)) != 0) {
+        return NULL;
+    }
+
+    pthread_mutex_lock(&combined_jobs_lock);
+    combined_job_t *job = combined_job_find_locked(
+        uri, mtime, size, samplerate, channels, vocal_final, instr_final);
+    if (job) {
+        combined_job_ref(job);
+    }
+    pthread_mutex_unlock(&combined_jobs_lock);
+    return job;
+}
+
+static int
+combined_job_build_raw_path(const char *final_path, combined_job_t *job, char *out, size_t out_sz) {
+    char f32tmp_dir[PATH_MAX];
+    get_f32tmp_dir(f32tmp_dir, sizeof(f32tmp_dir));
+    if (!f32tmp_dir[0]) {
+        return -1;
+    }
+    ensure_dir(f32tmp_dir);
+    const char *base = strrchr(final_path, '/');
+    base = base ? base + 1 : final_path;
+    char name[PATH_MAX];
+    if (snprintf(name, sizeof(name), "%s.f32tmp.%d.%llx",
+            base, (int)getpid(), (unsigned long long)(uintptr_t)job) < 0) {
+        return -1;
+    }
+    return safe_path_join2(out, out_sz, f32tmp_dir, name);
+}
+
+static void *
+combined_job_thread(void *arg) {
+    combined_job_t *job = (combined_job_t *)arg;
+    uint8_t buf[65536];
+    int vocal_open = job->vocal_pipe >= 0;
+    int instr_open = job->instr_pipe >= 0;
+    int failed = 0;
+
+    while ((vocal_open || instr_open) && !failed) {
+        pthread_mutex_lock(&job->lock);
+        int aborted = job->aborted;
+        pthread_mutex_unlock(&job->lock);
+        if (aborted) {
+            break;
+        }
+
+        struct pollfd pfds[3];
+        int vocal_idx = -1;
+        int instr_idx = -1;
+        int err_idx = -1;
+        nfds_t nfds = 0;
+        if (vocal_open) {
+            vocal_idx = (int)nfds;
+            pfds[nfds++] = (struct pollfd){.fd = job->vocal_pipe, .events = POLLIN | POLLHUP | POLLERR, .revents = 0};
+        }
+        if (instr_open) {
+            instr_idx = (int)nfds;
+            pfds[nfds++] = (struct pollfd){.fd = job->instr_pipe, .events = POLLIN | POLLHUP | POLLERR, .revents = 0};
+        }
+        if (job->stderr_log.fd >= 0) {
+            err_idx = (int)nfds;
+            pfds[nfds++] = (struct pollfd){.fd = job->stderr_log.fd, .events = POLLIN | POLLHUP | POLLERR, .revents = 0};
+        }
+
+        int pr = poll(pfds, nfds, 100);
+        if (pr < 0) {
+            if (errno == EINTR) {
+                continue;
             }
-            else {
-                trace("sourcesep: background failed to rename %s -> %s errno=%d\n", mp3_tmp_path, task->final_path, errno);
-                unlink(mp3_tmp_path);
+            failed = 1;
+            break;
+        }
+        if (err_idx >= 0 && (pfds[err_idx].revents & (POLLIN | POLLHUP | POLLERR))) {
+            inference_stderr_drain(&job->stderr_log);
+            if (pfds[err_idx].revents & (POLLHUP | POLLERR)) {
+                inference_stderr_close(&job->stderr_log);
+            }
+        }
+
+        for (int pass = 0; pass < 2 && !failed; pass++) {
+            int is_vocal = pass == 0;
+            int idx = is_vocal ? vocal_idx : instr_idx;
+            int *open = is_vocal ? &vocal_open : &instr_open;
+            if (idx < 0 || !*open || !(pfds[idx].revents & (POLLIN | POLLHUP | POLLERR))) {
+                continue;
+            }
+            int fd = is_vocal ? job->vocal_pipe : job->instr_pipe;
+            ssize_t got = read(fd, buf, sizeof(buf));
+            if (got > 0) {
+                FILE *out = is_vocal ? job->vocal_write : job->instr_write;
+                size_t wrote = out ? fwrite(buf, 1, (size_t)got, out) : 0;
+                if (wrote != (size_t)got) {
+                    trace("sourcesep: combined fwrite failed mode=%d errno=%d\n", is_vocal ? SOURCESEP_MODE_VOCAL : SOURCESEP_MODE_INSTRUMENTAL, errno);
+                    failed = 1;
+                    break;
+                }
+                fflush(out);
+                pthread_mutex_lock(&job->lock);
+                if (is_vocal) {
+                    job->vocal_bytes += (int64_t)wrote;
+                }
+                else {
+                    job->instr_bytes += (int64_t)wrote;
+                }
+                pthread_cond_broadcast(&job->cond);
+                pthread_mutex_unlock(&job->lock);
+                continue;
+            }
+            if (got == 0) {
+                close(fd);
+                if (is_vocal) {
+                    job->vocal_pipe = -1;
+                    vocal_open = 0;
+                }
+                else {
+                    job->instr_pipe = -1;
+                    instr_open = 0;
+                }
+                continue;
+            }
+            if (errno == EINTR) {
+                continue;
+            }
+            if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                continue;
+            }
+            trace("sourcesep: combined pipe read error mode=%d errno=%d\n", is_vocal ? SOURCESEP_MODE_VOCAL : SOURCESEP_MODE_INSTRUMENTAL, errno);
+            failed = 1;
+            break;
+        }
+    }
+
+    combined_job_close_pipes(job);
+
+    pthread_mutex_lock(&job->lock);
+    int aborted = job->aborted;
+    pthread_mutex_unlock(&job->lock);
+    if (aborted || failed) {
+        if (job->pid > 0) {
+            kill(job->pid, SIGKILL);
+        }
+    }
+
+    int child_ok = 0;
+    if (job->pid > 0) {
+        int status = 0;
+        waitpid(job->pid, &status, 0);
+        child_ok = WIFEXITED(status) && WEXITSTATUS(status) == 0;
+        trace("sourcesep: combined child exit pid=%d status=%d exited=%d code=%d signaled=%d sig=%d\n",
+            (int)job->pid,
+            status,
+            WIFEXITED(status),
+            WIFEXITED(status) ? WEXITSTATUS(status) : -1,
+            WIFSIGNALED(status),
+            WIFSIGNALED(status) ? WTERMSIG(status) : -1);
+        pthread_mutex_lock(&job->lock);
+        job->pid = 0;
+        pthread_mutex_unlock(&job->lock);
+    }
+    inference_stderr_close(&job->stderr_log);
+
+    if (job->vocal_write) {
+        fclose(job->vocal_write);
+        job->vocal_write = NULL;
+    }
+    if (job->instr_write) {
+        fclose(job->instr_write);
+        job->instr_write = NULL;
+    }
+
+    int success = 0;
+    if (!aborted && !failed && child_ok) {
+        int vocal_ok = finalize_raw_cache(
+            job->vocal_raw, job->vocal_final, job->samplerate, job->channels,
+            job->source_uri, job->source_mtime, job->source_size, SOURCESEP_MODE_VOCAL);
+        int instr_ok = finalize_raw_cache(
+            job->instr_raw, job->instr_final, job->samplerate, job->channels,
+            job->source_uri, job->source_mtime, job->source_size, SOURCESEP_MODE_INSTRUMENTAL);
+        success = vocal_ok == 0 && instr_ok == 0;
+        if (success) {
+            trace("sourcesep: combined caches finalized %s %s\n", job->vocal_final, job->instr_final);
+            cache_enforce_limit();
+        }
+        else {
+            trace("sourcesep: combined cache finalize failed vocal=%d instr=%d\n", vocal_ok, instr_ok);
+        }
+    }
+
+    pthread_mutex_lock(&job->lock);
+    job->finished = 1;
+    job->success = success;
+    pthread_cond_broadcast(&job->cond);
+    pthread_mutex_unlock(&job->lock);
+
+    combined_job_remove_from_list(job);
+    combined_job_unref(job); // active-list ref
+    combined_job_unref(job); // worker-thread ref
+    pthread_mutex_lock(&combined_jobs_lock);
+    combined_thread_count--;
+    pthread_cond_broadcast(&combined_jobs_cond);
+    pthread_mutex_unlock(&combined_jobs_lock);
+    return NULL;
+}
+
+static combined_job_t *
+combined_job_find_or_start(DB_playItem_t *it, int mode, int samplerate, int channels) {
+    combined_job_t *found = combined_job_find(it, mode, samplerate, channels);
+    if (found) {
+        return found;
+    }
+
+    char script[PATH_MAX] = {0};
+    deadbeef->conf_get_str("sourcesep.instrumental_separation_script", "", script, sizeof(script));
+    if (!script[0]) {
+        return NULL;
+    }
+    char uri[PATH_MAX] = {0};
+    get_track_source_uri(it, uri, sizeof(uri));
+    if (!uri[0]) {
+        return NULL;
+    }
+    int64_t mtime = 0;
+    int64_t size = 0;
+    get_uri_file_stat(uri, &mtime, &size);
+
+    char vocal_final[PATH_MAX];
+    char instr_final[PATH_MAX];
+    if (resolve_cache_final_path(it, SOURCESEP_MODE_VOCAL, vocal_final, sizeof(vocal_final)) != 0
+        || resolve_cache_final_path(it, SOURCESEP_MODE_INSTRUMENTAL, instr_final, sizeof(instr_final)) != 0) {
+        return NULL;
+    }
+    char cache_dir[PATH_MAX];
+    get_cache_dir(cache_dir, sizeof(cache_dir));
+    if (!cache_dir[0]) {
+        return NULL;
+    }
+    ensure_dir(cache_dir);
+
+    combined_job_t *job = calloc(1, sizeof(combined_job_t));
+    if (!job) {
+        return NULL;
+    }
+    pthread_mutex_init(&job->lock, NULL);
+    pthread_cond_init(&job->cond, NULL);
+    job->refs = 2; // active list + worker thread
+    job->samplerate = samplerate;
+    job->channels = channels;
+    job->source_mtime = mtime;
+    job->source_size = size;
+    job->vocal_pipe = -1;
+    job->instr_pipe = -1;
+    job->stderr_log.fd = -1;
+    snprintf(job->source_uri, sizeof(job->source_uri), "%s", uri);
+    snprintf(job->vocal_final, sizeof(job->vocal_final), "%s", vocal_final);
+    snprintf(job->instr_final, sizeof(job->instr_final), "%s", instr_final);
+    if (combined_job_build_raw_path(vocal_final, job, job->vocal_raw, sizeof(job->vocal_raw)) != 0
+        || combined_job_build_raw_path(instr_final, job, job->instr_raw, sizeof(job->instr_raw)) != 0) {
+        combined_job_free_unstarted(job);
+        return NULL;
+    }
+
+    const char *input_path = uri;
+    if (!strncmp(uri, "file://", 7)) {
+        input_path = uri + 7;
+    }
+
+    int vocal_pipe[2] = {-1, -1};
+    int instr_pipe[2] = {-1, -1};
+    int errpipe[2] = {-1, -1};
+    int forward_stderr = deadbeef->conf_get_int("sourcesep.trace", 0);
+    if (pipe(vocal_pipe) != 0) {
+        combined_job_free_unstarted(job);
+        return NULL;
+    }
+    if (pipe(instr_pipe) != 0) {
+        close(vocal_pipe[0]);
+        close(vocal_pipe[1]);
+        combined_job_free_unstarted(job);
+        return NULL;
+    }
+    if (forward_stderr && pipe(errpipe) != 0) {
+        forward_stderr = 0;
+    }
+
+    trace("sourcesep: combined spawn: \"%s\" --input \"%s\" --stream-f32le-both --stream-other-fd <pipe>\n", script, input_path);
+    pid_t pid = fork();
+    if (pid < 0) {
+        close(vocal_pipe[0]);
+        close(vocal_pipe[1]);
+        close(instr_pipe[0]);
+        close(instr_pipe[1]);
+        if (forward_stderr) {
+            close(errpipe[0]);
+            close(errpipe[1]);
+        }
+        combined_job_free_unstarted(job);
+        return NULL;
+    }
+    if (pid == 0) {
+        int stdout_fd = move_fd_above_stdio(vocal_pipe[1]);
+        int other_fd = move_fd_above_stdio(instr_pipe[1]);
+        int stderr_fd = -1;
+        if (stdout_fd < 0 || other_fd < 0) {
+            _exit(127);
+        }
+        close(vocal_pipe[0]);
+        close(instr_pipe[0]);
+        if (forward_stderr) {
+            stderr_fd = move_fd_above_stdio(errpipe[1]);
+            if (stderr_fd < 0) {
+                _exit(127);
+            }
+            close(errpipe[0]);
+        }
+        if (dup2(stdout_fd, STDOUT_FILENO) < 0) {
+            _exit(127);
+        }
+        close(stdout_fd);
+        if (forward_stderr) {
+            if (dup2(stderr_fd, STDERR_FILENO) < 0) {
+                _exit(127);
+            }
+            close(stderr_fd);
+        }
+        else {
+            int devnull = open("/dev/null", O_WRONLY);
+            if (devnull >= 0 && devnull != STDERR_FILENO) {
+                dup2(devnull, STDERR_FILENO);
+                close(devnull);
+            }
+        }
+        char fd_arg[16];
+        int fd_pos = (int)sizeof(fd_arg) - 1;
+        int fd_value = other_fd;
+        fd_arg[fd_pos] = 0;
+        do {
+            fd_arg[--fd_pos] = (char)('0' + (fd_value % 10));
+            fd_value /= 10;
+        } while (fd_value > 0);
+        execlp(
+            script, script,
+            "--input", input_path,
+            "--stream-f32le-both",
+            "--stream-other-fd", &fd_arg[fd_pos],
+            (char *)NULL
+        );
+        _exit(127);
+    }
+
+    close(vocal_pipe[1]);
+    close(instr_pipe[1]);
+    job->vocal_pipe = vocal_pipe[0];
+    job->instr_pipe = instr_pipe[0];
+    job->pid = pid;
+    int flags = fcntl(job->vocal_pipe, F_GETFL, 0);
+    if (flags >= 0) {
+        fcntl(job->vocal_pipe, F_SETFL, flags | O_NONBLOCK);
+    }
+    flags = fcntl(job->instr_pipe, F_GETFL, 0);
+    if (flags >= 0) {
+        fcntl(job->instr_pipe, F_SETFL, flags | O_NONBLOCK);
+    }
+    if (forward_stderr) {
+        close(errpipe[1]);
+        int eflags = fcntl(errpipe[0], F_GETFL, 0);
+        if (eflags >= 0) {
+            fcntl(errpipe[0], F_SETFL, eflags | O_NONBLOCK);
+        }
+        job->stderr_log.fd = errpipe[0];
+    }
+
+    job->vocal_write = fopen(job->vocal_raw, "wb");
+    job->instr_write = fopen(job->instr_raw, "wb");
+    if (!job->vocal_write || !job->instr_write) {
+        trace("sourcesep: combined cache open failed vocal=%s instr=%s errno=%d\n",
+            job->vocal_raw, job->instr_raw, errno);
+        combined_job_free_unstarted(job);
+        return NULL;
+    }
+
+    pthread_mutex_lock(&combined_jobs_lock);
+    if (combined_jobs_stopping) {
+        pthread_mutex_unlock(&combined_jobs_lock);
+        combined_job_free_unstarted(job);
+        return NULL;
+    }
+    combined_job_t *existing = combined_job_find_locked(
+        uri, mtime, size, samplerate, channels, vocal_final, instr_final);
+    if (existing) {
+        combined_job_ref(existing);
+        pthread_mutex_unlock(&combined_jobs_lock);
+        combined_job_free_unstarted(job);
+        return existing;
+    }
+    job->next = combined_jobs;
+    combined_jobs = job;
+    combined_thread_count++;
+    pthread_mutex_unlock(&combined_jobs_lock);
+
+    combined_job_ref(job); // caller ref, held before the worker can finish
+    if (pthread_create(&job->thread, NULL, combined_job_thread, job) != 0) {
+        pthread_mutex_lock(&combined_jobs_lock);
+        combined_thread_count--;
+        pthread_cond_broadcast(&combined_jobs_cond);
+        pthread_mutex_unlock(&combined_jobs_lock);
+        combined_job_remove_from_list(job);
+        pthread_mutex_lock(&job->lock);
+        job->aborted = 1;
+        job->finished = 1;
+        pthread_cond_broadcast(&job->cond);
+        pthread_mutex_unlock(&job->lock);
+        if (job->pid > 0) {
+            kill(job->pid, SIGKILL);
+            waitpid(job->pid, NULL, 0);
+            job->pid = 0;
+        }
+        combined_job_close_pipes(job);
+        inference_stderr_close(&job->stderr_log);
+        if (job->vocal_write) {
+            fclose(job->vocal_write);
+            job->vocal_write = NULL;
+        }
+        if (job->instr_write) {
+            fclose(job->instr_write);
+            job->instr_write = NULL;
+        }
+        combined_job_unref(job); // active-list ref
+        combined_job_unref(job); // worker-thread ref
+        combined_job_unref(job); // caller ref
+        return NULL;
+    }
+    pthread_detach(job->thread);
+    return job;
+}
+
+static int
+combined_job_attach(sourcesep_info_t *ri, combined_job_t *job) {
+    if (!ri || !job) {
+        return -1;
+    }
+    const char *raw_path = ri->mode == SOURCESEP_MODE_VOCAL ? job->vocal_raw : job->instr_raw;
+    const char *final_path = ri->mode == SOURCESEP_MODE_VOCAL ? job->vocal_final : job->instr_final;
+    if (!raw_path[0] || !final_path[0]) {
+        combined_job_unref(job);
+        return -1;
+    }
+    if (ri->cache_fp) {
+        fclose(ri->cache_fp);
+        ri->cache_fp = NULL;
+    }
+    if (ri->cache_snd) {
+        sf_close(ri->cache_snd);
+        ri->cache_snd = NULL;
+    }
+    ri->cache_fp = fopen(raw_path, "rb");
+    if (!ri->cache_fp) {
+        trace("sourcesep: combined attach failed to open raw %s errno=%d\n", raw_path, errno);
+        combined_job_unref(job);
+        return -1;
+    }
+    ri->combined_job = job;
+    ri->samplerate = job->samplerate;
+    ri->channels = job->channels;
+    ri->bytes_per_frame = ri->channels * 4;
+    ri->using_cache = 1;
+    ri->need_spawn = 0;
+    ri->cache_data_offset = 0;
+    ri->cache_valid = 0;
+    ri->stream_finished = 0;
+    ri->cache_bytes_written = combined_job_bytes(job, ri->mode);
+    snprintf(ri->cache_raw_path, sizeof(ri->cache_raw_path), "%s", raw_path);
+    snprintf(ri->cache_final_path, sizeof(ri->cache_final_path), "%s", final_path);
+    trace("sourcesep: attached to combined job mode=%d raw=%s bytes=%lld\n",
+        ri->mode, raw_path, (long long)ri->cache_bytes_written);
+    return 0;
+}
+
+static int64_t
+combined_job_wait_bytes(combined_job_t *job, int mode, int64_t target, int timeout_ms, int *finished) {
+    int64_t bytes = 0;
+    struct timespec deadline;
+    clock_gettime(CLOCK_REALTIME, &deadline);
+    timespec_add_ms(&deadline, timeout_ms);
+    pthread_mutex_lock(&job->lock);
+    for (;;) {
+        bytes = mode == SOURCESEP_MODE_VOCAL ? job->vocal_bytes : job->instr_bytes;
+        if (bytes >= target || job->finished) {
+            break;
+        }
+        int rc = pthread_cond_timedwait(&job->cond, &job->lock, &deadline);
+        if (rc == ETIMEDOUT) {
+            bytes = mode == SOURCESEP_MODE_VOCAL ? job->vocal_bytes : job->instr_bytes;
+            break;
+        }
+    }
+    if (finished) {
+        *finished = job->finished;
+    }
+    pthread_mutex_unlock(&job->lock);
+    return bytes;
+}
+
+static int64_t
+combined_job_bytes(combined_job_t *job, int mode) {
+    pthread_mutex_lock(&job->lock);
+    int64_t bytes = mode == SOURCESEP_MODE_VOCAL ? job->vocal_bytes : job->instr_bytes;
+    pthread_mutex_unlock(&job->lock);
+    return bytes;
+}
+
+static int
+combined_job_wait_finished(combined_job_t *job, int timeout_ms) {
+    struct timespec deadline;
+    clock_gettime(CLOCK_REALTIME, &deadline);
+    if (timeout_ms > 0) {
+        timespec_add_ms(&deadline, timeout_ms);
+    }
+    pthread_mutex_lock(&job->lock);
+    while (!job->finished) {
+        if (timeout_ms > 0) {
+            int rc = pthread_cond_timedwait(&job->cond, &job->lock, &deadline);
+            if (rc == ETIMEDOUT) {
+                break;
             }
         }
         else {
-            trace("sourcesep: background mp3 temp too small %s\n", mp3_tmp_path);
-            unlink(mp3_tmp_path);
+            pthread_cond_wait(&job->cond, &job->lock);
         }
     }
-    else {
-        trace("sourcesep: background failed to convert raw to mp3 %s\n", task->raw_path);
+    int success = job->finished && job->success;
+    pthread_mutex_unlock(&job->lock);
+    return success;
+}
+
+static void
+combined_jobs_shutdown(void) {
+    struct timespec deadline;
+    clock_gettime(CLOCK_REALTIME, &deadline);
+    timespec_add_ms(&deadline, 5000);
+    pthread_mutex_lock(&combined_jobs_lock);
+    combined_jobs_stopping = 1;
+    for (combined_job_t *job = combined_jobs; job; job = job->next) {
+        pthread_mutex_lock(&job->lock);
+        job->aborted = 1;
+        pid_t pid = job->pid;
+        pthread_cond_broadcast(&job->cond);
+        pthread_mutex_unlock(&job->lock);
+        if (pid > 0) {
+            kill(pid, SIGKILL);
+        }
     }
-    free(task);
+    while (combined_jobs || combined_thread_count > 0) {
+        int rc = pthread_cond_timedwait(&combined_jobs_cond, &combined_jobs_lock, &deadline);
+        if (rc == ETIMEDOUT) {
+            trace("sourcesep: combined shutdown timed out jobs=%p threads=%d\n",
+                (void *)combined_jobs, combined_thread_count);
+            break;
+        }
+    }
+    pthread_mutex_unlock(&combined_jobs_lock);
 }
 
 static void
@@ -2399,6 +3275,20 @@ sourcesep_free(DB_fileinfo_t *_info) {
         ri->cache_snd = NULL;
     }
 
+    if (ri->combined_job) {
+        trace("sourcesep: detaching combined job mode=%d\n", ri->mode);
+        combined_job_unref(ri->combined_job);
+        ri->combined_job = NULL;
+        ri->stream_finished = 1;
+        ri->owns_temp_cache = 0;
+        if (ri->track) {
+            deadbeef->pl_item_unref(ri->track);
+            ri->track = NULL;
+        }
+        free(ri);
+        return;
+    }
+
     if (ri->child_pid > 0) {
         kill(ri->child_pid, SIGTERM);
     }
@@ -2418,6 +3308,33 @@ sourcesep_free(DB_fileinfo_t *_info) {
 }
 
 static int
+is_active_playback_for_uri(const char *source_uri) {
+    DB_output_t *output = deadbeef->get_output();
+    ddb_playback_state_t st = output ? output->state() : DDB_PLAYBACK_STATE_STOPPED;
+    DB_playItem_t *playing = deadbeef->streamer_get_playing_track_safe();
+    int active = 0;
+    if ((st == DDB_PLAYBACK_STATE_PLAYING || st == DDB_PLAYBACK_STATE_PAUSED) && playing) {
+        char playing_src[PATH_MAX] = {0};
+        deadbeef->pl_lock();
+        const char *src = deadbeef->pl_find_meta(playing, ":SOURCESEP_SOURCE_URI");
+        if (!src) {
+            src = deadbeef->pl_find_meta(playing, ":URI");
+        }
+        if (src) {
+            snprintf(playing_src, sizeof(playing_src), "%s", src);
+        }
+        deadbeef->pl_unlock();
+        if (playing_src[0] && source_uri && !strcmp(playing_src, source_uri)) {
+            active = 1;
+        }
+    }
+    if (playing) {
+        deadbeef->pl_item_unref(playing);
+    }
+    return active;
+}
+
+static int
 sourcesep_read(DB_fileinfo_t *_info, char *buffer, int nbytes) {
     sourcesep_info_t *ri = (sourcesep_info_t *)_info;
     if (nbytes <= 0) {
@@ -2429,7 +3346,23 @@ sourcesep_read(DB_fileinfo_t *_info, char *buffer, int nbytes) {
     }
 
     int read_bytes = 0;
-    if (ri->need_spawn && ri->pipe_fd < 0 && !ri->stream_finished) {
+    if (ri->combined && ri->need_spawn && !ri->combined_job && !ri->stream_finished) {
+        if (!is_active_playback_for_uri(ri->source_uri)) {
+            trace("sourcesep: suppress combined spawn src=%s\n", ri->source_uri);
+            return 0;
+        }
+        combined_job_t *job = combined_job_find_or_start(ri->track, ri->mode, ri->samplerate, ri->channels);
+        if (!job) {
+            trace("sourcesep: combined job start failed\n");
+            return 0;
+        }
+        if (combined_job_attach(ri, job) != 0) {
+            trace("sourcesep: combined job attach failed\n");
+            return 0;
+        }
+        trace("sourcesep: combined job started/attached mode=%d\n", ri->mode);
+    }
+    if (ri->need_spawn && !ri->combined && ri->pipe_fd < 0 && !ri->stream_finished) {
             if (ri->cache_raw_path[0] || !ri->owns_temp_cache) {
                 char existing_raw[PATH_MAX] = {0};
                 if (find_existing_temp_raw_for_cache(ri->cache_final_path, existing_raw, sizeof(existing_raw)) == 0) {
@@ -2450,32 +3383,9 @@ sourcesep_read(DB_fileinfo_t *_info, char *buffer, int nbytes) {
                 }
             }
     }
-    if (ri->need_spawn && ri->pipe_fd < 0 && !ri->stream_finished) {
-            DB_output_t *output = deadbeef->get_output();
-            ddb_playback_state_t st = output ? output->state() : DDB_PLAYBACK_STATE_STOPPED;
-            DB_playItem_t *playing = deadbeef->streamer_get_playing_track_safe();
-            int is_active_playback = 0;
-            char playing_src_copy[PATH_MAX] = {0};
-            if ((st == DDB_PLAYBACK_STATE_PLAYING || st == DDB_PLAYBACK_STATE_PAUSED) && playing) {
-                deadbeef->pl_lock();
-                const char *playing_src = deadbeef->pl_find_meta(playing, ":SOURCESEP_SOURCE_URI");
-                if (!playing_src) {
-                    playing_src = deadbeef->pl_find_meta(playing, ":URI");
-                }
-                if (playing_src) {
-                    snprintf(playing_src_copy, sizeof(playing_src_copy), "%s", playing_src);
-                }
-                deadbeef->pl_unlock();
-                if (playing_src_copy[0] && !strcmp(playing_src_copy, ri->source_uri)) {
-                    is_active_playback = 1;
-                }
-            }
-            if (playing) {
-                deadbeef->pl_item_unref(playing);
-            }
-            if (!is_active_playback) {
-                trace("sourcesep: suppress spawn st=%d active=%d src=%s playing_src=%s\n",
-                    st, is_active_playback, ri->source_uri, playing_src_copy[0] ? playing_src_copy : "(none)");
+    if (ri->need_spawn && !ri->combined && ri->pipe_fd < 0 && !ri->stream_finished) {
+            if (!is_active_playback_for_uri(ri->source_uri)) {
+                trace("sourcesep: suppress spawn src=%s\n", ri->source_uri);
                 return 0;
             }
             if (spawn_inference(ri, ri->source_uri, ri->mode) != 0) {
@@ -2486,7 +3396,16 @@ sourcesep_read(DB_fileinfo_t *_info, char *buffer, int nbytes) {
             trace("sourcesep: spawn consumed need_spawn=0\n");
     }
 
-    if (ri->pipe_fd >= 0) {
+    if (ri->combined_job) {
+        int64_t target = ri->cache_data_offset + ri->data_bytes_read + aligned;
+        int finished = 0;
+        int64_t bytes = combined_job_wait_bytes(ri->combined_job, ri->mode, target, 10000, &finished);
+        ri->cache_bytes_written = bytes;
+        if (finished) {
+            ri->stream_finished = 1;
+        }
+    }
+    else if (ri->pipe_fd >= 0) {
         int64_t target = ri->cache_data_offset + ri->data_bytes_read + aligned;
         drain_pipe_to_cache(ri, target);
         if (!ri->stream_finished && ri->cache_bytes_written < target) {
@@ -2608,6 +3527,9 @@ sourcesep_load(DB_functions_t *api) {
 
 static int
 sourcesep_start(void) {
+    pthread_mutex_lock(&combined_jobs_lock);
+    combined_jobs_stopping = 0;
+    pthread_mutex_unlock(&combined_jobs_lock);
     char cache_dir[PATH_MAX];
     get_cache_dir(cache_dir, sizeof(cache_dir));
     if (cache_dir[0]) {
@@ -2678,6 +3600,7 @@ sourcesep_message(uint32_t id, uintptr_t ctx, uint32_t p1, uint32_t p2) {
 
 static int
 sourcesep_stop(void) {
+    combined_jobs_shutdown();
     cache_remove_dir_all();
     mode_button = NULL;
     gtkui_api = NULL;
@@ -2691,6 +3614,7 @@ static const char settings_dlg[] =
     "property \"Vocal Separation Output Sample Rate\" entry sourcesep.vocal_separation_samplerate 0;\n"
     "property \"Instrumental Separation Script\" file sourcesep.instrumental_separation_script \"\";\n"
     "property \"Instrumental Separation Output Sample Rate\" entry sourcesep.instrumental_separation_samplerate 0;\n"
+    "property \"Generate vocals and instrumental in one instrumental-script pass\" checkbox sourcesep.vocals_from_instrumental_script 0;\n"
     "property \"Cache size limit (MB)\" entry sourcesep.cache_limit_mb 1024;\n"
     "property \"Enable verbose logging\" checkbox sourcesep.trace 0;\n";
 

@@ -15,9 +15,10 @@ It can switch playback between:
 - Statusbar toggle button with emoji mode indicator.
 - Action: `Playback/Toggle Source Separation Mode`.
 - Direct inference execution via a script (e.g. `inference.py`) streaming float32 PCM.
+- Optional single-pass generation of both stems by the instrumental script; the script must support `--stream-f32le-both` and `--stream-other-fd`.
 - Cache in `/tmp/deadbeef-$UID-sourcesep-cache`.
 - Live raw temp caches (`*.f32tmp*`) are stored separately in `/tmp/deadbeef-$UID-sourcesep-cache-f32tmp` (lazy-created, cleaned on startup and exit).
-- Cache filename uses the original source filename stem (plus mode suffix): `<name>.instr.mp3` / `<name>.vocal.mp3`.
+- Cache filename uses the original source filename stem (plus mode suffix): `<name>.instr.mp3` / `<name>.vocal.mp3`. With single-pass generation enabled, the vocal suffix is `<name>.vocal-instr.mp3` so the two vocal variants don't overwrite each other; the instrumental cache is shared.
 - Cache directory is created lazily on first write (not on plugin load).
 - Persistent `index.txt` cache map across restarts.
 - Cache size limit in MB (`sourcesep.cache_limit_mb`, default 1024).
@@ -88,10 +89,11 @@ In DeaDBeeF plugin settings, set **Vocal Separation Script** and **Instrumental 
 
 In DeaDBeeF plugin settings:
 
-- **Vocal Separation Script** (`sourcesep.vocal_separation_script`): called with `--input <path> --stream-f32le-vocal` arguments.
-- **Vocal Separation Output Sample Rate** (`sourcesep.vocal_separation_samplerate`): sample rate of the script's raw f32le stdout; `0` uses the source track's rate.
-- **Instrumental Separation Script** (`sourcesep.instrumental_separation_script`): called with `--input <path> --stream-f32le-instrumental` arguments.
-- **Instrumental Separation Output Sample Rate** (`sourcesep.instrumental_separation_samplerate`): sample rate of the script's raw f32le stdout; `0` uses the source track's rate.
+- **Vocal Separation Script** (`sourcesep.vocal_separation_script`): called with `--input <path> --stream-f32le-vocal` arguments. Not used when **Generate vocals and instrumental in one instrumental-script pass** is enabled.
+- **Vocal Separation Output Sample Rate** (`sourcesep.vocal_separation_samplerate`): sample rate of the script's raw f32le stdout; `0` uses the source track's rate. Ignored when single-pass generation is enabled.
+- **Instrumental Separation Script** (`sourcesep.instrumental_separation_script`): normally called with `--input <path> --stream-f32le-instrumental`. With single-pass generation enabled, called once with `--input <path> --stream-f32le-both --stream-other-fd <fd>`; the script writes the vocal stem as f32le to stdout and the instrumental stem as f32le to `<fd>`.
+- **Instrumental Separation Output Sample Rate** (`sourcesep.instrumental_separation_samplerate`): sample rate of the script's raw f32le output; `0` uses the source track's rate. Also applies to the vocal stem in single-pass mode.
+- **Generate vocals and instrumental in one instrumental-script pass** (`sourcesep.vocals_from_instrumental_script`, default off): run the instrumental script once for a track and generate both the vocal and instrumental caches. The vocal cache gets the `.vocal-instr.mp3` suffix. If the instrumental script is empty, vocal mode falls back to the vocal script.
 - **Enable verbose logging** (`sourcesep.trace`, default off)
 - **Cache size limit (MB)** (`sourcesep.cache_limit_mb`, default `1024`)
 
@@ -130,12 +132,13 @@ Only `complete=1` entries are used as cache hits.
 
 On startup, orphan `.mp3` files not referenced by `index.txt` are removed.
 
-If playback stops before inference completes, incomplete cache is removed.
+Normal streaming inference removes its incomplete temp cache when playback stops or inference fails. A combined instrumental-script job keeps running after the decoder detaches and finalizes both caches; plugin shutdown kills active combined jobs.
 
 ## Troubleshooting
 
 - Enable verbose logging (`sourcesep.trace=1`) and inspect DeaDBeeF log. Inference script output is included.
 - Verify `sourcesep.vocal_separation_script` points to the correct script path.
+- When **Generate vocals and instrumental in one instrumental-script pass** is enabled, verify the instrumental script supports `--stream-f32le-both` and `--stream-other-fd` and that its output sample rate is set correctly.
 - Verify the script is executable and can run (it's called directly).
 - If needed, clear cache directory:
   - `/tmp/deadbeef-$UID-sourcesep-cache`
