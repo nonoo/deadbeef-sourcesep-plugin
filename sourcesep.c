@@ -29,10 +29,11 @@ static char restart_uri[PATH_MAX] = {0};
 
 static int sourcesep_seek_sample(DB_fileinfo_t *_info, int sample);
 static int get_samplerate(DB_playItem_t *it);
+static int get_separation_samplerate(DB_playItem_t *it, int mode);
 static int get_channels(DB_playItem_t *it);
 static void notify_waveform_refresh_for_source(const char *source_uri);
 static int uri_protected_from_precache_eviction(const char *uri);
-static int cache_index_lookup(const char *uri, int mode, int64_t mtime, int64_t size, int *samplerate, int *channels, char *cache_file_out, size_t out_sz);
+static int cache_index_lookup(const char *uri, int mode, int64_t mtime, int64_t size, int expected_samplerate, int *samplerate, int *channels, char *cache_file_out, size_t out_sz);
 static int resolve_cache_final_path(DB_playItem_t *it, int mode, char *out, size_t out_sz);
 static void cache_index_rewrite_with_filter(const char *remove_cache_path, int mode);
 static int convert_raw_to_mp3(const char *raw_path, const char *mp3_path, int samplerate, int channels);
@@ -644,15 +645,15 @@ precache_make_room_or_stop(void) {
 }
 
 static int
-cache_has_complete_entry(const char *uri, int mode, int64_t mtime, int64_t size) {
+cache_has_complete_entry(const char *uri, int mode, int64_t mtime, int64_t size, int expected_samplerate) {
     int sr = 0;
     int ch = 0;
     char cache_file[PATH_MAX];
-    return cache_index_lookup(uri, mode, mtime, size, &sr, &ch, cache_file, sizeof(cache_file)) == 0;
+    return cache_index_lookup(uri, mode, mtime, size, expected_samplerate, &sr, &ch, cache_file, sizeof(cache_file)) == 0;
 }
 
 static int
-cache_index_lookup(const char *uri, int mode, int64_t mtime, int64_t size, int *samplerate, int *channels, char *cache_file_out, size_t out_sz) {
+cache_index_lookup(const char *uri, int mode, int64_t mtime, int64_t size, int expected_samplerate, int *samplerate, int *channels, char *cache_file_out, size_t out_sz) {
     char index_path[PATH_MAX];
     if (get_cache_index_path(index_path, sizeof(index_path)) != 0) {
         return -1;
@@ -673,6 +674,9 @@ cache_index_lookup(const char *uri, int mode, int64_t mtime, int64_t size, int *
         }
         if (e.mode == mode && e.mtime == mtime && e.size == size && !strcmp(e.uri, uri)) {
             if (!e.complete) {
+                continue;
+            }
+            if (expected_samplerate > 0 && e.samplerate != expected_samplerate) {
                 continue;
             }
             if (!path_has_mp3_ext(e.cache_file)) {
@@ -1285,7 +1289,9 @@ precache_single_track(DB_playItem_t *it, int mode) {
     int64_t mtime = 0;
     int64_t size = 0;
     get_uri_file_stat(uri_copy, &mtime, &size);
-    if (cache_has_complete_entry(uri_copy, mode, mtime, size)) {
+    int sr = get_separation_samplerate(it, mode);
+    int ch = get_channels(it);
+    if (cache_has_complete_entry(uri_copy, mode, mtime, size, sr)) {
         return;
     }
     if (uri_is_currently_playing_or_loaded(uri_copy)) {
@@ -1303,7 +1309,7 @@ precache_single_track(DB_playItem_t *it, int mode) {
         return;
     }
 
-    if (cache_has_complete_entry(uri_copy, mode, mtime, size)) {
+    if (cache_has_complete_entry(uri_copy, mode, mtime, size, sr)) {
         return;
     }
     if (uri_is_currently_playing_or_loaded(uri_copy)) {
@@ -1317,8 +1323,6 @@ precache_single_track(DB_playItem_t *it, int mode) {
         return;
     }
 
-    int sr = get_samplerate(it);
-    int ch = get_channels(it);
     const char *stream_arg = mode == SOURCESEP_MODE_VOCAL ? "--stream-f32le-vocal" : "--stream-f32le-instrumental";
 
     int pipefd[2];
@@ -1671,6 +1675,18 @@ get_samplerate(DB_playItem_t *it) {
     int sr = deadbeef->pl_find_meta_int(it, ":SAMPLERATE", 44100);
     if (sr <= 0) {
         sr = 44100;
+    }
+    return sr;
+}
+
+static int
+get_separation_samplerate(DB_playItem_t *it, int mode) {
+    const char *key = mode == SOURCESEP_MODE_VOCAL ?
+        "sourcesep.vocal_separation_samplerate" :
+        "sourcesep.instrumental_separation_samplerate";
+    int sr = deadbeef->conf_get_int(key, 0);
+    if (sr <= 0) {
+        sr = get_samplerate(it);
     }
     return sr;
 }
@@ -2145,11 +2161,13 @@ sourcesep_init(DB_fileinfo_t *_info, DB_playItem_t *it) {
     trace("sourcesep: init mode=%d uri=%s mtime=%lld size=%lld\n",
         ri->mode, ri->source_uri, (long long)ri->source_mtime, (long long)ri->source_size);
 
+    int separation_sr = get_separation_samplerate(it, ri->mode);
     if (cache_index_lookup(
             ri->source_uri,
             ri->mode,
             ri->source_mtime,
             ri->source_size,
+            separation_sr,
             &ri->samplerate,
             &ri->channels,
             ri->cache_final_path,
@@ -2157,7 +2175,7 @@ sourcesep_init(DB_fileinfo_t *_info, DB_playItem_t *it) {
         trace("sourcesep: index hit %s\n", ri->cache_final_path);
     }
     else {
-        ri->samplerate = get_samplerate(it);
+        ri->samplerate = separation_sr;
         ri->channels = get_channels(it);
         if (resolve_cache_final_path(it, ri->mode, ri->cache_final_path, sizeof(ri->cache_final_path)) != 0) {
             return -1;
@@ -2469,19 +2487,19 @@ sourcesep_read(DB_fileinfo_t *_info, char *buffer, int nbytes) {
     }
 
     if (ri->pipe_fd >= 0) {
-        int64_t target = ri->cache_data_offset + ri->data_bytes_read + ri->bytes_per_frame;
+        int64_t target = ri->cache_data_offset + ri->data_bytes_read + aligned;
         drain_pipe_to_cache(ri, target);
-        if (!ri->stream_finished && ri->cache_bytes_written <= ri->cache_data_offset + ri->data_bytes_read) {
+        if (!ri->stream_finished && ri->cache_bytes_written < target) {
             int tries = 0;
-            while (!ri->stream_finished && ri->cache_bytes_written <= ri->cache_data_offset + ri->data_bytes_read && tries++ < 200) {
+            while (!ri->stream_finished && ri->cache_bytes_written < target && tries++ < 200) {
                 inference_stderr_drain(&ri->stderr_log);
                 struct pollfd pfd = {.fd = ri->pipe_fd, .events = POLLIN | POLLHUP | POLLERR, .revents = 0};
                 int pr = poll(&pfd, 1, 50);
                 if (pr < 0 && errno != EINTR) {
                     break;
                 }
-                drain_pipe_to_cache(ri, ri->cache_data_offset + ri->data_bytes_read + ri->bytes_per_frame);
-                if (pr == 0 && ri->cache_bytes_written <= ri->cache_data_offset + ri->data_bytes_read) {
+                drain_pipe_to_cache(ri, target);
+                if (pr == 0 && ri->cache_bytes_written < target) {
                     continue;
                 }
             }
@@ -2523,6 +2541,10 @@ sourcesep_read(DB_fileinfo_t *_info, char *buffer, int nbytes) {
     }
 
     read_bytes -= (read_bytes % ri->bytes_per_frame);
+    if (read_bytes > 0 && read_bytes < aligned && !ri->stream_finished) {
+        trace("sourcesep: short read got=%d want=%d written=%lld data=%lld\n",
+            read_bytes, aligned, (long long)ri->cache_bytes_written, (long long)ri->data_bytes_read);
+    }
     if (read_bytes <= 0) {
         return 0;
     }
@@ -2666,7 +2688,9 @@ static const char *exts[] = {"wav", "flac", "mp3", NULL};
 
 static const char settings_dlg[] =
     "property \"Vocal Separation Script\" file sourcesep.vocal_separation_script \"\";\n"
+    "property \"Vocal Separation Output Sample Rate\" entry sourcesep.vocal_separation_samplerate 0;\n"
     "property \"Instrumental Separation Script\" file sourcesep.instrumental_separation_script \"\";\n"
+    "property \"Instrumental Separation Output Sample Rate\" entry sourcesep.instrumental_separation_samplerate 0;\n"
     "property \"Cache size limit (MB)\" entry sourcesep.cache_limit_mb 1024;\n"
     "property \"Enable verbose logging\" checkbox sourcesep.trace 0;\n";
 
