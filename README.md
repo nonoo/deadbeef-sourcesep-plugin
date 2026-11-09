@@ -24,7 +24,7 @@ It can switch playback between:
 - During cache evaluation, sourcesep first removes cache files not related to current playback context (not in current playlist and not currently playing/loaded).
 - During precache overflow, oldest cache is evicted unless it belongs to the current playing entry or any entry after it in the current playlist; in that case precaching pauses.
 - Cache directory is removed when DeaDBeeF exits (plugin stop).
-- Optional verbose logging to DeaDBeeF internal log (`sourcesep.trace=1`).
+- Optional verbose logging to DeaDBeeF internal log (`sourcesep.trace=1`). When enabled, the inference script's stderr output (progress and errors) is forwarded to the same log.
 
 ## Build
 
@@ -130,7 +130,7 @@ If playback stops before inference completes, incomplete cache is removed.
 
 ## Troubleshooting
 
-- Enable verbose logging (`sourcesep.trace=1`) and inspect DeaDBeeF log.
+- Enable verbose logging (`sourcesep.trace=1`) and inspect DeaDBeeF log. Inference script output is included.
 - Verify `sourcesep.vocal_separation_script` points to the correct script path.
 - Verify the script is executable and can run (it's called directly).
 - If needed, clear cache directory:

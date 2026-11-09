@@ -43,6 +43,15 @@ static int convert_raw_to_mp3(const char *raw_path, const char *mp3_path, int sa
 
 #define CACHE_LIMIT_BYTES (1024LL * 1024LL * 1024LL)
 #define CACHE_LIMIT_DEFAULT_MB 1024
+
+#define INFERENCE_STDERR_LINE_MAX 1024
+
+typedef struct {
+    int fd;
+    char line[INFERENCE_STDERR_LINE_MAX];
+    size_t line_len;
+} inference_stderr_t;
+
 typedef struct {
     DB_fileinfo_t info;
     DB_playItem_t *track;
@@ -61,6 +70,7 @@ typedef struct {
     int64_t cache_frames_written;
 
     int pipe_fd;
+    inference_stderr_t stderr_log;
     pid_t child_pid;
     FILE *cache_fp_write;
     char cache_final_path[PATH_MAX];
@@ -105,6 +115,58 @@ static DB_plugin_action_t mode_action;
         deadbeef->log_detailed(&plugin.plugin, 0, __VA_ARGS__); \
     } \
 } while (0)
+
+static void
+inference_stderr_flush_line(inference_stderr_t *st) {
+    if (st->line_len == 0) {
+        return;
+    }
+    st->line[st->line_len] = 0;
+    trace("sourcesep: inference: %s\n", st->line);
+    st->line_len = 0;
+}
+
+static void
+inference_stderr_drain(inference_stderr_t *st) {
+    if (st->fd < 0) {
+        return;
+    }
+    char buf[512];
+    for (;;) {
+        ssize_t n = read(st->fd, buf, sizeof(buf));
+        if (n > 0) {
+            for (ssize_t i = 0; i < n; i++) {
+                char c = buf[i];
+                if (c == '\n' || c == '\r') {
+                    inference_stderr_flush_line(st);
+                    continue;
+                }
+                if (st->line_len + 1 >= sizeof(st->line)) {
+                    inference_stderr_flush_line(st);
+                }
+                st->line[st->line_len++] = c;
+            }
+            continue;
+        }
+        if (n < 0 && errno == EINTR) {
+            continue;
+        }
+        if (n == 0) {
+            inference_stderr_flush_line(st);
+        }
+        break;
+    }
+}
+
+static void
+inference_stderr_close(inference_stderr_t *st) {
+    inference_stderr_drain(st);
+    inference_stderr_flush_line(st);
+    if (st->fd >= 0) {
+        close(st->fd);
+        st->fd = -1;
+    }
+}
 
 static const char *
 mode_emoji(int mode) {
@@ -1264,12 +1326,22 @@ precache_single_track(DB_playItem_t *it, int mode) {
         return;
     }
 
+    int errpipe[2] = {-1, -1};
+    int forward_stderr = deadbeef->conf_get_int("sourcesep.trace", 0);
+    if (forward_stderr && pipe(errpipe) != 0) {
+        forward_stderr = 0;
+    }
+
     trace("sourcesep: precache spawn inference: \"%s\" --input \"%s\" %s\n", script, uri_copy, stream_arg);
 
     pid_t pid = fork();
     if (pid < 0) {
         close(pipefd[0]);
         close(pipefd[1]);
+        if (forward_stderr) {
+            close(errpipe[0]);
+            close(errpipe[1]);
+        }
         return;
     }
 
@@ -1278,10 +1350,17 @@ precache_single_track(DB_playItem_t *it, int mode) {
         dup2(pipefd[1], STDOUT_FILENO);
         close(pipefd[1]);
 
-        int devnull = open("/dev/null", O_WRONLY);
-        if (devnull >= 0) {
-            dup2(devnull, STDERR_FILENO);
-            close(devnull);
+        if (forward_stderr) {
+            close(errpipe[0]);
+            dup2(errpipe[1], STDERR_FILENO);
+            close(errpipe[1]);
+        }
+        else {
+            int devnull = open("/dev/null", O_WRONLY);
+            if (devnull >= 0) {
+                dup2(devnull, STDERR_FILENO);
+                close(devnull);
+            }
         }
 
         execlp(script, script, "--input", uri_copy, stream_arg, (char *)NULL);
@@ -1289,6 +1368,16 @@ precache_single_track(DB_playItem_t *it, int mode) {
     }
 
     close(pipefd[1]);
+
+    inference_stderr_t errlog = {.fd = -1};
+    if (forward_stderr) {
+        close(errpipe[1]);
+        int eflags = fcntl(errpipe[0], F_GETFL, 0);
+        if (eflags >= 0) {
+            fcntl(errpipe[0], F_SETFL, eflags | O_NONBLOCK);
+        }
+        errlog.fd = errpipe[0];
+    }
 
     SF_INFO out_sfinfo = {0};
     out_sfinfo.format = SF_FORMAT_MPEG | SF_FORMAT_MPEG_LAYER_III;
@@ -1300,6 +1389,7 @@ precache_single_track(DB_playItem_t *it, int mode) {
         close(pipefd[0]);
         kill(pid, SIGTERM);
         waitpid(pid, NULL, 0);
+        inference_stderr_close(&errlog);
         return;
     }
 
@@ -1309,14 +1399,45 @@ precache_single_track(DB_playItem_t *it, int mode) {
     sf_command(out, SFC_SET_COMPRESSION_LEVEL, &bitrate_level, sizeof(bitrate_level));
 
     float buf[8192];
-    ssize_t got;
     size_t frame_sz = ch * 4;
-    while ((got = read(pipefd[0], buf, sizeof(buf))) > 0) {
+    for (;;) {
+        struct pollfd pfds[2] = {
+            {.fd = pipefd[0], .events = POLLIN, .revents = 0},
+            {.fd = errlog.fd, .events = POLLIN, .revents = 0},
+        };
+        nfds_t nfds = errlog.fd >= 0 ? 2 : 1;
+        int pr = poll(pfds, nfds, -1);
+        if (pr < 0) {
+            if (errno == EINTR) {
+                continue;
+            }
+            break;
+        }
+        if (nfds == 2 && (pfds[1].revents & (POLLIN | POLLHUP | POLLERR))) {
+            inference_stderr_drain(&errlog);
+            if (pfds[1].revents & (POLLHUP | POLLERR)) {
+                inference_stderr_close(&errlog);
+            }
+        }
+        if (!(pfds[0].revents & (POLLIN | POLLHUP | POLLERR))) {
+            continue;
+        }
+        ssize_t got = read(pipefd[0], buf, sizeof(buf));
+        if (got < 0) {
+            if (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK) {
+                continue;
+            }
+            break;
+        }
+        if (got == 0) {
+            break;
+        }
         if (uri_is_currently_playing_or_loaded(uri_copy)) {
             trace("sourcesep: precache stopped, track started playing: %s\n", uri_copy);
             close(pipefd[0]);
             kill(pid, SIGTERM);
             waitpid(pid, NULL, 0);
+            inference_stderr_close(&errlog);
             sf_close(out);
             unlink(final_path);
             return;
@@ -1331,6 +1452,7 @@ precache_single_track(DB_playItem_t *it, int mode) {
 
     int status = 0;
     waitpid(pid, &status, 0);
+    inference_stderr_close(&errlog);
     if (!(WIFEXITED(status) && WEXITSTATUS(status) == 0)) {
         trace("sourcesep: precache inference failed status=%d\n", WEXITSTATUS(status));
         unlink(final_path);
@@ -1730,10 +1852,20 @@ spawn_inference(sourcesep_info_t *ri, const char *src_uri, int mode) {
         return -1;
     }
 
+    int errpipe[2] = {-1, -1};
+    int forward_stderr = deadbeef->conf_get_int("sourcesep.trace", 0);
+    if (forward_stderr && pipe(errpipe) != 0) {
+        forward_stderr = 0;
+    }
+
     pid_t pid = fork();
     if (pid < 0) {
         close(pipefd[0]);
         close(pipefd[1]);
+        if (forward_stderr) {
+            close(errpipe[0]);
+            close(errpipe[1]);
+        }
         return -1;
     }
 
@@ -1742,10 +1874,17 @@ spawn_inference(sourcesep_info_t *ri, const char *src_uri, int mode) {
         dup2(pipefd[1], STDOUT_FILENO);
         close(pipefd[1]);
 
-        int devnull = open("/dev/null", O_WRONLY);
-        if (devnull >= 0) {
-            dup2(devnull, STDERR_FILENO);
-            close(devnull);
+        if (forward_stderr) {
+            close(errpipe[0]);
+            dup2(errpipe[1], STDERR_FILENO);
+            close(errpipe[1]);
+        }
+        else {
+            int devnull = open("/dev/null", O_WRONLY);
+            if (devnull >= 0) {
+                dup2(devnull, STDERR_FILENO);
+                close(devnull);
+            }
         }
 
         execlp(
@@ -1759,6 +1898,14 @@ spawn_inference(sourcesep_info_t *ri, const char *src_uri, int mode) {
 
     close(pipefd[1]);
     ri->pipe_fd = pipefd[0];
+    if (forward_stderr) {
+        close(errpipe[1]);
+        int eflags = fcntl(errpipe[0], F_GETFL, 0);
+        if (eflags >= 0) {
+            fcntl(errpipe[0], F_SETFL, eflags | O_NONBLOCK);
+        }
+        ri->stderr_log.fd = errpipe[0];
+    }
     ri->child_pid = pid;
     int flags = fcntl(ri->pipe_fd, F_GETFL, 0);
     if (flags >= 0) {
@@ -1844,6 +1991,7 @@ drain_pipe_to_cache(sourcesep_info_t *ri, int64_t min_total_bytes) {
     }
     uint8_t buf[65536];
     for (;;) {
+        inference_stderr_drain(&ri->stderr_log);
         if (min_total_bytes >= 0 && ri->cache_bytes_written >= min_total_bytes) {
             struct pollfd pfd = {.fd = ri->pipe_fd, .events = POLLIN | POLLHUP | POLLERR, .revents = 0};
             int pr = poll(&pfd, 1, 0);
@@ -1957,6 +2105,7 @@ sourcesep_open(uint32_t hints) {
         return NULL;
     }
     ri->pipe_fd = -1;
+    ri->stderr_log.fd = -1;
     return &ri->info;
 }
 
@@ -2139,6 +2288,8 @@ finish_stream(sourcesep_info_t *ri, int aborted) {
         ri->pipe_fd = -1;
     }
 
+    inference_stderr_drain(&ri->stderr_log);
+
     int child_ok = 1;
     if (ri->child_pid > 0) {
         int status = 0;
@@ -2153,6 +2304,7 @@ finish_stream(sourcesep_info_t *ri, int aborted) {
             WIFSIGNALED(status) ? WTERMSIG(status) : -1);
         ri->child_pid = 0;
     }
+    inference_stderr_close(&ri->stderr_log);
 
     if (ri->cache_fp_write) {
         fclose(ri->cache_fp_write);
@@ -2322,6 +2474,7 @@ sourcesep_read(DB_fileinfo_t *_info, char *buffer, int nbytes) {
         if (!ri->stream_finished && ri->cache_bytes_written <= ri->cache_data_offset + ri->data_bytes_read) {
             int tries = 0;
             while (!ri->stream_finished && ri->cache_bytes_written <= ri->cache_data_offset + ri->data_bytes_read && tries++ < 200) {
+                inference_stderr_drain(&ri->stderr_log);
                 struct pollfd pfd = {.fd = ri->pipe_fd, .events = POLLIN | POLLHUP | POLLERR, .revents = 0};
                 int pr = poll(&pfd, 1, 50);
                 if (pr < 0 && errno != EINTR) {
